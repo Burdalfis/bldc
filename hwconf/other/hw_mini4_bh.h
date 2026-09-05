@@ -2,6 +2,7 @@
 #define HW_MINI4_BH_H_
 
 #include "utils_sys.h"
+#include "conf_general.h"
 #include "hw_mini4_bh_core.inc"
 #include "hw_mini4_bh_policy.inc"
 
