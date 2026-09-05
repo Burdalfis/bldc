@@ -281,8 +281,11 @@ static bool bh_queue_job(bh_job_t job) {
 	bh_stop_requested = false;
 	bh_job = job;
 	if (!bh_tp) {
+		// Measurement is diagnostic/background work. Keep it below the normal
+		// watchdog, USB and telemetry housekeeping priority so RT Data cannot be
+		// starved by the tracer even when acquisition is busy.
 		bh_tp = chThdCreateStatic(bh_thread_wa, sizeof(bh_thread_wa),
-				NORMALPRIO + 1, bh_thread, 0);
+				NORMALPRIO - 1, bh_thread, 0);
 	} else {
 		chEvtSignal(bh_tp, (eventmask_t)1);
 	}
