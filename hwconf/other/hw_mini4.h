@@ -25,8 +25,12 @@
 // HW properties
 #define HW_HAS_DRV8301
 #define HW_HAS_3_SHUNTS
-#define HW_HAS_PERMANENT_NRF
 #define HW_HAS_PHASE_SHUNTS
+#define HW_MINI4_BH_TRACER
+
+// NOTE: The original MINI4 target defined HW_HAS_PERMANENT_NRF. This B-H
+// tracer intentionally does not: COMM A1 is PA5, which is also SPI1 SCK.
+// Automatic NRF initialization would reconfigure/toggle the INA282 ADC pin.
 
 // Macros
 #define ENABLE_GATE()              palClearPad(GPIOB, 5)
