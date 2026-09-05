@@ -31,6 +31,7 @@
 #define BH_TWO_BY_SQRT3              1.15470053838f
 
 #define BH_SAMPLE_HZ                 4000.0f
+#define BH_RL_SAMPLE_HZ              2000.0f
 #define BH_PLOT_HZ                   100.0f
 #define BH_CURRENT_BW_HZ             250.0f
 #define BH_MAX_CURRENT_A             10.0f
@@ -42,10 +43,14 @@
 #define BH_SETTLE_CYCLES             1
 #define BH_OFFSET_CYCLES             1
 
-#define BH_RL_DEFAULT_CURRENT_A      0.25f
+// Use a large but very short current pulse for the R fit. This gives much more
+// V=IR signal than the old 0.25 A test without appreciably heating the 26 AWG
+// fixture winding. The AC L measurement remains small-signal to avoid saturation.
+#define BH_RL_DEFAULT_CURRENT_A      5.0f
+#define BH_RL_AC_CURRENT_A           0.25f
 #define BH_RL_DEFAULT_FREQ_HZ        50.0f
-#define BH_RL_MIN_CURRENT_A          0.05f
-#define BH_RL_MAX_CURRENT_A          1.0f
+#define BH_RL_MIN_CURRENT_A          0.10f
+#define BH_RL_MAX_CURRENT_A          5.0f
 #define BH_RL_MIN_FREQ_HZ            5.0f
 #define BH_RL_MAX_FREQ_HZ            200.0f
 
@@ -79,7 +84,10 @@ typedef struct {
 	bool valid;
 } bh_metrics_t;
 
-static THD_WORKING_AREA(bh_thread_wa, 1536);
+// Float formatting, configuration changes and the analysis helpers can nest
+// fairly deeply. Give this diagnostic thread ample stack so a test cannot turn
+// a marginal stack into a hard fault/reset.
+static THD_WORKING_AREA(bh_thread_wa, 4096);
 static thread_t *bh_tp = 0;
 static volatile bool bh_running = false;
 static volatile bool bh_stop_requested = false;
@@ -230,16 +238,20 @@ static bool bh_ramp_current(float from, float to, float seconds) {
 }
 
 static bool bh_measure_dc_point(float target, float *i_avg, float *v_avg) {
-	if (!bh_ramp_current(0.0f, target, 0.25f)) {
+	// The old low-current routine dwelled for almost a second per point. With a
+	// 5 A R measurement that would self-heat this tiny winding and bias the fit.
+	// These short ramps/holds give the current loop ample time to settle while
+	// keeping each high-current pulse below about 0.1 s.
+	if (!bh_ramp_current(0.0f, target, 0.020f)) {
 		return false;
 	}
-	if (!bh_wait_and_check(0.20f)) {
+	if (!bh_wait_and_check(0.020f)) {
 		return false;
 	}
 
 	double isum = 0.0;
 	double vsum = 0.0;
-	const int samples = 400;
+	const int samples = 80;
 	for (int i = 0; i < samples; i++) {
 		if (bh_stop_requested) {
 			return false;
@@ -253,10 +265,10 @@ static bool bh_measure_dc_point(float target, float *i_avg, float *v_avg) {
 					mc_interface_fault_to_string(fault));
 			return false;
 		}
-		chThdSleepMilliseconds(1);
+		chThdSleepMicroseconds(500);
 	}
 
 	*i_avg = (float)(isum / (double)samples);
 	*v_avg = (float)(vsum / (double)samples);
-	return bh_ramp_current(target, 0.0f, 0.15f);
+	return bh_ramp_current(target, 0.0f, 0.010f);
 }
