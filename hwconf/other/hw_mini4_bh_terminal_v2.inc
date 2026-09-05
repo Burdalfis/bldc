@@ -21,6 +21,14 @@ static void terminal_bh_sense_pol(int argc, const char **argv) {
 	commands_printf("BH sense polarity set to %+d (RAM only).", bh_sense_polarity);
 }
 
+static int bh_log_sweep_points(float lo, float hi, float ppo) {
+	if (!(lo > 0.0f && hi >= lo && ppo > 0.0f)) {
+		return 0;
+	}
+	float oct = logf(hi / lo) / logf(2.0f);
+	return (int)floorf(oct * ppo + 1e-5f) + 1;
+}
+
 static bool bh_queue_l_sweep(float imin, float imax, float ippo,
 		float fmin, float fmax, float fppo) {
 	if (bh_is_busy()) {
@@ -34,6 +42,14 @@ static bool bh_queue_l_sweep(float imin, float imax, float ippo,
 		commands_printf("L-sweep limits: 0<Imin<=Imax<=%.1f A, %.1f<=fmin<=fmax<=%.1f Hz, 1..24 points/octave.",
 				(double)BH_MAX_CURRENT_A, (double)BH_RL_MIN_FREQ_HZ,
 				(double)BH_RL_MAX_FREQ_HZ);
+		return false;
+	}
+
+	int ipoints = bh_log_sweep_points(imin, imax, ippo);
+	int fpoints = bh_log_sweep_points(fmin, fmax, fppo);
+	if (ipoints < 1 || fpoints < 1 || ipoints * fpoints > BH_MAX_SWEEP_POINTS) {
+		commands_printf("L-sweep matrix too large: %d current x %d frequency = %d points; max=%d.",
+				ipoints, fpoints, ipoints * fpoints, BH_MAX_SWEEP_POINTS);
 		return false;
 	}
 
@@ -51,7 +67,8 @@ static bool bh_queue_l_sweep(float imin, float imax, float ippo,
 		bh_l_sweep_mode = false;
 		return false;
 	}
-	commands_printf("BH inductance matrix queued: I %.6f..%.6f A @ %.2f pts/oct, f %.6f..%.6f Hz @ %.2f pts/oct, sense=%+d",
+	commands_printf("BH inductance matrix queued: %d points (%d I x %d f), I %.6f..%.6f A @ %.2f pts/oct, f %.6f..%.6f Hz @ %.2f pts/oct, sense=%+d",
+			ipoints * fpoints, ipoints, fpoints,
 			(double)imin, (double)imax, (double)ippo,
 			(double)fmin, (double)fmax, (double)fppo,
 			bh_sense_polarity);
