@@ -57,6 +57,7 @@ static const I2CConfig i2cfg = {
 #define BH_MIN_FREQ_HZ           0.2f
 #define BH_MAX_FREQ_HZ           50.0f
 #define BH_MAX_CYCLES            100
+#define BH_TWO_BY_SQRT3          1.15470053838f
 
 static THD_WORKING_AREA(bh_thread_wa, 768);
 static thread_t *bh_tp = 0;
@@ -127,8 +128,8 @@ static void terminal_bh_run(int argc, const char **argv) {
 		return;
 	}
 
-	if (bh_running) {
-		commands_printf("A B-H test is already running. Use bh_stop first.");
+	if (bh_running || bh_i_pk > 0.0f) {
+		commands_printf("A B-H test is already running or queued. Use bh_stop first.");
 		return;
 	}
 
@@ -206,6 +207,8 @@ static THD_FUNCTION(bh_thread, arg) {
 		cfg->foc_motor_flux_linkage = 1e-6f;
 		cfg->foc_f_zv = 30000.0f;
 		cfg->foc_control_sample_mode = FOC_CONTROL_SAMPLE_MODE_V0_V7;
+		// Keep the bridge actively regulating through exact zero crossings.
+		cfg->cc_min_current = 0.0f;
 
 		// VESC current-loop convention: Kp=L*bw, Ki=R*bw.
 		// 1 kHz is intentionally conservative for this measurement fixture.
@@ -213,7 +216,7 @@ static THD_FUNCTION(bh_thread, arg) {
 		cfg->foc_current_kp = bh_l_h * current_bw;
 		cfg->foc_current_ki = bh_r_ohm * current_bw;
 
-		float id_lim = bh_i_pk * (2.0f / SQRT3);
+		float id_lim = bh_i_pk * BH_TWO_BY_SQRT3;
 		cfg->l_current_max = fmaxf(cfg->l_current_max, id_lim * 1.25f);
 		cfg->l_current_min = fminf(cfg->l_current_min, -id_lim * 1.25f);
 		cfg->l_abs_current_max = fmaxf(cfg->l_abs_current_max, id_lim * 1.5f);
@@ -260,7 +263,7 @@ static THD_FUNCTION(bh_thread, arg) {
 
 			float tri = bh_triangle(t * bh_freq);
 			float i_cmd = bh_i_pk * tri;
-			float id_cmd = i_cmd * (2.0f / SQRT3);
+			float id_cmd = i_cmd * BH_TWO_BY_SQRT3;
 
 			timeout_reset();
 			mc_interface_lock_override_once();
@@ -284,8 +287,8 @@ static THD_FUNCTION(bh_thread, arg) {
 
 			float h_apm = BH_EXC_TURNS * i_coil / bh_path_m;
 
-			// Send raw data at 100 Hz to keep terminal bandwidth reasonable. Acquisition
-			// and integration still run at 2 kHz.
+			// Send live data at 100 Hz to keep VESC Tool/USB traffic well below the
+			// 2 kHz acquisition/integration loop rate.
 			if ((sample_n % plot_div) == 0) {
 				commands_send_plot_points(h_apm, b_t);
 				commands_printf("BH_RAW %.7f,%.7f,%.7f,%u,%.7f,%.9f,%.7f,%.9f",
