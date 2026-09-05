@@ -209,7 +209,8 @@ static bool bh_run_one(float freq, bool sine_wave, bool print_raw, bh_metrics_t 
 	commands_printf("BH_LFREQ_DONE f=%.6f Hz points=%d", (double)freq, point);
 	m->valid = any_ok;
 	bh_l_sweep_suppress_metric = true;
-	if (freq >= bh_fmax * 0.999999f) {
+	float next_freq = freq * powf(2.0f, 1.0f / bh_sweep_step);
+	if (next_freq > bh_fmax * 1.000001f) {
 		bh_l_sweep_mode = false;
 	}
 	return any_ok;
