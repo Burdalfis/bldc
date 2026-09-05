@@ -21,10 +21,14 @@
         bldc-fw = pkgs.callPackage ./pkgs/bldc.nix {
           src = self;
         };
+        bldc-fw-mini4 = pkgs.callPackage ./pkgs/bldc.nix {
+          src = self;
+          fwBoards = [ "mini4" ];
+        };
       in
       {
         packages = {
-          inherit bldc-fw;
+          inherit bldc-fw bldc-fw-mini4;
           default = bldc-fw;
         };
       }
