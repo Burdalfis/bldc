@@ -220,12 +220,27 @@ static THD_FUNCTION(bh_thread, arg) {
 		bh_job_t job = bh_job;
 		bh_running = true;
 		bh_stop_requested = false;
+
+		// The stock VESC IWDG is deliberately very tight: roughly 12..33 ms
+		// over LSI tolerance. A diagnostic acquisition plus high-rate VESC Tool
+		// RT Data can occasionally delay the normal watchdog housekeeping thread
+		// enough to cause a nuisance reset. During a B-H job only, use VESC's
+		// existing slow watchdog setting (roughly 22..60 s), then restore the
+		// normal watchdog before returning to ordinary ESC operation.
+		utils_sys_lock_cnt();
+		timeout_configure_IWDT_slowest();
+		utils_sys_unlock_cnt();
+		commands_printf("BH_WDT slow mode active for tracer job");
+
 		mc_configuration *cfg_old = mempools_alloc_mcconf();
 		mc_configuration *cfg = mempools_alloc_mcconf();
 		if (!cfg_old || !cfg) {
 			commands_printf("BH_ABORT could not allocate motor configuration");
 			if (cfg) mempools_free_mcconf(cfg);
 			if (cfg_old) mempools_free_mcconf(cfg_old);
+			utils_sys_lock_cnt();
+			timeout_configure_IWDT();
+			utils_sys_unlock_cnt();
 			bh_job = BH_JOB_NONE;
 			bh_running = false;
 			continue;
@@ -289,6 +304,11 @@ static THD_FUNCTION(bh_thread, arg) {
 		mc_interface_set_configuration(cfg_old);
 		mempools_free_mcconf(cfg);
 		mempools_free_mcconf(cfg_old);
+
+		utils_sys_lock_cnt();
+		timeout_configure_IWDT();
+		utils_sys_unlock_cnt();
+		commands_printf("BH_WDT normal mode restored");
 
 		if (job == BH_JOB_MEASURE_RL && !ok) {
 			commands_printf("BH_RL_DONE ABORTED");
