@@ -47,7 +47,7 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 	double loop_area = 0.0;
 	double vhs[BH_MAX_HARMONIC + 1] = {0};
 	double vhc[BH_MAX_HARMONIC + 1] = {0};
-	double i_s = 0.0, i_c = 0.0, v_s = 0.0, v_c = 0.0;
+	double i_s = 0.0, i_c = 0.0;
 	int sample_n = 0;
 
 	int max_h = (int)(BH_SAMPLE_HZ / (4.0f * freq));
@@ -122,11 +122,8 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 				vhs[n] += (double)vs * sinf((float)n * ang) * dt;
 				vhc[n] += (double)vs * cosf((float)n * ang) * dt;
 			}
-			float vline = bh_line_voltage();
 			i_s += (double)i_now * sinf(ang) * dt;
 			i_c += (double)i_now * cosf(ang) * dt;
-			v_s += (double)vline * sinf(ang) * dt;
-			v_c += (double)vline * cosf(ang) * dt;
 		}
 
 		if ((sample_n % plot_div) == 0) {
@@ -180,12 +177,22 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 	}
 	m->thd = (float)sqrt(thd_sq);
 
-	// Fundamental excitation impedance at this exact frequency.
+	// Fundamental fixture impedance referred through the search winding. The
+	// search coil measures Ns*dPhi/dt directly, so (Np/Ns)*Vs is the core-linked
+	// primary back-EMF. This avoids relying on the FOC controller's reconstructed
+	// millivolt-level terminal voltage, which is strongly affected by dead-time
+	// compensation near zero current. Sense lead polarity is chosen such that
+	// the inductive reactance is positive; the same sign is then applied to the
+	// in-phase magnetic-loss component. Add the measured DC line resistance to
+	// obtain total effective Rac. Primary leakage inductance is not included.
 	double zden = i_s * i_s + i_c * i_c;
 	if (zden > 1e-18) {
-		m->r_ac = (float)((v_s * i_s + v_c * i_c) / zden);
-		float x = (float)((v_c * i_s - v_s * i_c) / zden);
-		m->l_ac = x / (2.0f * M_PI * freq);
+		float r_sec = (float)((vhs[1] * i_s + vhc[1] * i_c) / zden);
+		float x_sec = (float)((vhc[1] * i_s - vhs[1] * i_c) / zden);
+		float sense_sign = x_sec >= 0.0f ? 1.0f : -1.0f;
+		float turns_ratio = BH_EXC_TURNS / BH_SENSE_TURNS;
+		m->r_ac = bh_r_line_ohm + turns_ratio * sense_sign * r_sec;
+		m->l_ac = turns_ratio * fabsf(x_sec) / (2.0f * M_PI * freq);
 	}
 
 	// One extra identically phased cycle finds Hc after the one-cycle B offset
