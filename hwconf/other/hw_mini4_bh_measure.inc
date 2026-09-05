@@ -1,8 +1,12 @@
 static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float freq) {
-	commands_printf("BH_RL_START I=%.4f A, f=%.3f Hz", (double)current, (double)freq);
+	const float ac_current = fminf(current, BH_RL_AC_CURRENT_A);
+	commands_printf("BH_RL_START Ir=%.4f A Il=%.4f A f=%.3f Hz",
+			(double)current, (double)ac_current, (double)freq);
 
 	// Four-point bipolar DC fit. The slope suppresses voltage offset and is much
-	// less sensitive to inverter asymmetry than a single V/I reading.
+	// less sensitive to inverter asymmetry than a single V/I reading. The high
+	// current pulses are deliberately short (see bh_measure_dc_point) so the
+	// 26 AWG excitation winding does not appreciably self-heat during the fit.
 	const float target[4] = {-1.0f, -0.5f, 0.5f, 1.0f};
 	double si = 0.0, sv = 0.0, sii = 0.0, siv = 0.0;
 	for (int n = 0; n < 4; n++) {
@@ -31,15 +35,24 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 		bh_release_locked();
 		return false;
 	}
+	commands_printf("BH_RL_STAGE R_DONE Rline=%.6f mOhm Voff=%.6f V",
+			(double)(r_line * 1e3f), (double)v_offset);
 
-	// Raise the integrator using the measured R, then measure the complex A-B
-	// impedance with a small sinusoidal current. We use actual Vab and Iab
-	// phasors, so current-loop amplitude/phase error does not bias the impedance.
+	// The resistance test can use several amps for SNR, but inductance must be
+	// measured with a small AC current. Driving the core at 5 A here would push
+	// it deep into saturation and report the saturated incremental inductance.
+	// Release the bridge before changing controller gains to keep the FOC state
+	// transition as boring as possible.
+	bh_release_locked();
+	chThdSleepMilliseconds(20);
+	commands_printf("BH_RL_STAGE AC_CONFIG");
 	bh_set_measurement_gains(cfg, r_line);
 	mc_interface_set_configuration(cfg);
 	chThdSleepMilliseconds(50);
+	commands_printf("BH_RL_STAGE AC_START I=%.4f A f=%.3f Hz",
+			(double)ac_current, (double)freq);
 
-	const float dt_target = 1.0f / BH_SAMPLE_HZ;
+	const float dt_target = 1.0f / BH_RL_SAMPLE_HZ;
 	const int settle_cycles = 2;
 	const int measure_cycles = 8;
 	const float total_time = (float)(settle_cycles + measure_cycles) / freq;
@@ -54,7 +67,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 			break;
 		}
 		float ph = 2.0f * M_PI * freq * t;
-		float i_cmd = current * sinf(ph);
+		float i_cmd = ac_current * sinf(ph);
 		bh_apply_current(i_cmd);
 
 		float i_now = bh_coil_current();
@@ -105,7 +118,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 				(double)(l_line * 1e6f), (double)r_ac, (double)i_amp);
 		return false;
 	}
-	if (i_amp < fmaxf(0.010f, current * 0.05f)) {
+	if (i_amp < fmaxf(0.010f, ac_current * 0.05f)) {
 		commands_printf("BH_RL_ABORT AC current amplitude too small: %.6f A", (double)i_amp);
 		return false;
 	}
