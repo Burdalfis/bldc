@@ -26,6 +26,23 @@ static void bh_keep_programmed_run_gains(mc_configuration *cfg) {
 	(void)cfg;
 }
 
+static float bh_programmed_current_bw_hz(void) {
+	const volatile mc_configuration *cfg = mc_interface_get_configuration();
+	float sum = 0.0f;
+	int n = 0;
+	if (bh_rl_valid && bh_l_line_h > 1e-9f && cfg->foc_current_kp > 0.0f) {
+		float l_d = 0.5f * bh_l_line_h;
+		sum += cfg->foc_current_kp / l_d / (2.0f * M_PI);
+		n++;
+	}
+	if (bh_rl_valid && bh_r_line_ohm > 1e-6f && cfg->foc_current_ki > 0.0f) {
+		float r_d = 0.5f * bh_r_line_ohm;
+		sum += cfg->foc_current_ki / r_d / (2.0f * M_PI);
+		n++;
+	}
+	return n > 0 ? sum / (float)n : 0.0f;
+}
+
 /* All downstream search-voltage calculations already divide by BH_INA_GAIN.
  * Making its sign depend on bh_sense_polarity applies the explicit polarity to
  * B integration, B-H plots, harmonics and impedance without altering the raw
@@ -33,6 +50,13 @@ static void bh_keep_programmed_run_gains(mc_configuration *cfg) {
  */
 #undef BH_INA_GAIN
 #define BH_INA_GAIN (50.0f / (float)bh_sense_polarity)
+
+/* Legacy status text prints BH_CURRENT_BW_HZ. Once gains are user-controlled,
+ * derive that number from programmed Kp/Ki and the measured fixed-axis plant
+ * instead of claiming the old hard-coded 250 Hz design target.
+ */
+#undef BH_CURRENT_BW_HZ
+#define BH_CURRENT_BW_HZ (bh_programmed_current_bw_hz())
 
 #define bh_set_measurement_gains bh_keep_programmed_measurement_gains
 #define bh_set_run_gains bh_keep_programmed_run_gains
