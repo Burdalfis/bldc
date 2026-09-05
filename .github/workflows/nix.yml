@@ -20,5 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Build
+      - name: Build default package
         run: nix build
+      - name: Build MINI4 B-H firmware
+        run: nix build .#bldc-fw-mini4
