@@ -1,3 +1,78 @@
+static void terminal_bh_ctrl_print(void) {
+	const volatile mc_configuration *cfg = mc_interface_get_configuration();
+	float bw_kp = 0.0f;
+	float bw_ki = 0.0f;
+	if (cfg->foc_motor_l > 1e-12f) {
+		bw_kp = cfg->foc_current_kp / (2.0f * M_PI * cfg->foc_motor_l);
+	}
+	if (cfg->foc_motor_r > 1e-12f) {
+		bw_ki = cfg->foc_current_ki / (2.0f * M_PI * cfg->foc_motor_r);
+	}
+	commands_printf("BH_CTRL_PROGRAMMED Kp=%.7f Ki=%.7f R=%.6f mOhm L=%.6f uH BWkp=%.2f Hz BWki=%.2f Hz",
+			(double)cfg->foc_current_kp, (double)cfg->foc_current_ki,
+			(double)(cfg->foc_motor_r * 1e3f), (double)(cfg->foc_motor_l * 1e6f),
+			(double)bw_kp, (double)bw_ki);
+}
+
+static bool bh_ctrl_apply(float kp, float ki, bool save) {
+	if (bh_is_busy()) {
+		commands_printf("Cannot change current-controller gains while a B-H job is active.");
+		return false;
+	}
+	if (!(kp > 0.0f && kp <= 5.0f) || !(ki > 0.0f && ki <= 5000.0f)) {
+		commands_printf("BH controller limits: 0<Kp<=5, 0<Ki<=5000.");
+		return false;
+	}
+
+	mc_configuration *cfg = mempools_alloc_mcconf();
+	if (!cfg) {
+		commands_printf("BH_CTRL_ABORT could not allocate motor configuration.");
+		return false;
+	}
+	*cfg = *mc_interface_get_configuration();
+	cfg->foc_current_kp = kp;
+	cfg->foc_current_ki = ki;
+	mc_interface_set_configuration(cfg);
+
+	bool stored = true;
+	if (save) {
+		stored = conf_general_store_mc_configuration(cfg, false);
+	}
+	mempools_free_mcconf(cfg);
+
+	if (save) {
+		commands_printf("BH controller Kp=%.7f Ki=%.7f applied; EEPROM save %s.",
+				(double)kp, (double)ki, stored ? "OK" : "FAILED");
+	} else {
+		commands_printf("BH controller Kp=%.7f Ki=%.7f applied in RAM only.",
+				(double)kp, (double)ki);
+	}
+	terminal_bh_ctrl_print();
+	return stored;
+}
+
+static void terminal_bh_ctrl(int argc, const char **argv) {
+	if (argc == 1) {
+		terminal_bh_ctrl_print();
+		return;
+	}
+	if (argc != 3) {
+		commands_printf("Usage: bh_ctrl [Kp Ki]");
+		commands_printf("Example: bh_ctrl 0.06 188");
+		return;
+	}
+	bh_ctrl_apply(strtof(argv[1], 0), strtof(argv[2], 0), false);
+}
+
+static void terminal_bh_ctrl_save(int argc, const char **argv) {
+	if (argc != 3) {
+		commands_printf("Usage: bh_ctrl_save <Kp> <Ki>");
+		commands_printf("Example: bh_ctrl_save 0.06 188");
+		return;
+	}
+	bh_ctrl_apply(strtof(argv[1], 0), strtof(argv[2], 0), true);
+}
+
 static void terminal_bh_sense_pol(int argc, const char **argv) {
 	if (bh_is_busy()) {
 		commands_printf("Cannot change sense polarity while a B-H job is active.");
@@ -98,6 +173,16 @@ static void terminal_bh_l_point(int argc, const char **argv) {
 
 static void bh_init_commands(void) {
 	bh_init_commands_legacy();
+	terminal_register_command_callback(
+			"bh_ctrl",
+			"Get or set the programmed FOC current-controller Kp/Ki without VESC Tool motor-config access.",
+			"[Kp Ki]",
+			terminal_bh_ctrl);
+	terminal_register_command_callback(
+			"bh_ctrl_save",
+			"Set FOC current-controller Kp/Ki and persist the motor configuration to EEPROM.",
+			"<Kp> <Ki>",
+			terminal_bh_ctrl_save);
 	terminal_register_command_callback(
 			"bh_sense_pol",
 			"Get or set search-winding polarity used by B-H integration and diagnostics.",
