@@ -108,8 +108,56 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
     }
     bh_apply_current(i_line);
 }
+
+/* Fast mode sees raw phase-current samples at PWM cadence. Isolated switching
+ * spikes were large enough to fool the cycle peak tracker even when the useful
+ * triangle was well behaved. A causal 3-sample median removes one-sample
+ * outliers without materially changing a 10..200 Hz waveform at 30 kHz.
+ */
+static inline float bh_fast_coil_current_median(void) {
+    static float h0 = 0.0f;
+    static float h1 = 0.0f;
+    static float h2 = 0.0f;
+    static unsigned n = 0U;
+
+    float x = bh_coil_current();
+    h0 = h1;
+    h1 = h2;
+    h2 = x;
+    if (n < 3U) {
+        n++;
+        return x;
+    }
+
+    float a = h0, b = h1, c = h2;
+    if (a > b) { float t = a; a = b; b = t; }
+    if (b > c) { float t = b; b = c; c = t; }
+    if (a > b) { float t = a; a = b; b = t; }
+    return b;
+}
+
+/* Experiment Plot packets are comparatively expensive. The fast acquisition
+ * buffers hundreds of points per selected cycle; sending them as one tight
+ * burst can monopolize the USB/packet path for long enough to starve Sampled
+ * Data and even the motor timeout. Keep roughly one quarter of the already
+ * decimated plot points and yield 2 ms between transmitted points. Acquisition
+ * and B integration remain at the full PWM rate; this affects display traffic
+ * only. About 90 points per loop at 10 Hz is still plenty to see loop shape.
+ */
+static unsigned bh_fast_plot_tx_decim = 0U;
+static inline void bh_fast_send_plot_point(float x, float y) {
+    if ((bh_fast_plot_tx_decim++ & 3U) == 0U) {
+        commands_send_plot_points(x, y);
+        chThdSleepMilliseconds(2);
+    }
+}
+
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
+#define bh_coil_current() bh_fast_coil_current_median()
+#define commands_send_plot_points(x, y) bh_fast_send_plot_point((x), (y))
 #include "hw_mini4_bh_fast.inc"
+#undef commands_send_plot_points
+#undef bh_coil_current
 #undef bh_apply_current
 
 #include "hw_mini4_bh_worker_v2.inc"
