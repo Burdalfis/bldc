@@ -43,7 +43,15 @@ static inline void bh_rtos_sleep(float seconds) {
 #include "hw_mini4_bh_capture.inc"
 #undef bh_run_one
 #undef bh_print_metrics
+
+/* Keep capture_v2 as the base implementation, then let the live tracer wrap
+ * bh_run_one/bh_print_metrics without disturbing the inductance-sweep path.
+ */
+#define bh_run_one bh_run_one_v2_base
+#define bh_print_metrics bh_print_metrics_v2_base
 #include "hw_mini4_bh_capture_v2.inc"
+#undef bh_run_one
+#undef bh_print_metrics
 
 #undef timer_sleep
 
@@ -56,17 +64,23 @@ static inline void bh_rtos_sleep(float seconds) {
 #include "hw_mini4_bh_terminal.inc"
 #undef bh_init_commands
 #undef bh_thread
+
+/* The live wrapper needs the legacy command parser/queue helpers above and
+ * must be visible before worker_v2 calls bh_run_one().
+ */
+#include "hw_mini4_bh_live.inc"
 #include "hw_mini4_bh_worker_v2.inc"
 #include "hw_mini4_bh_zero_diag.inc"
 
 /* Keep terminal_v2 intact: rename its initializer, then wrap it so the new
- * static bridge-state diagnostics are registered as well.
+ * live-loop command and static bridge-state diagnostics are registered too.
  */
 #define bh_init_commands bh_init_commands_v2_base
 #include "hw_mini4_bh_terminal_v2.inc"
 #undef bh_init_commands
 static void bh_init_commands(void) {
     bh_init_commands_v2_base();
+    bh_live_init_commands();
     bh_zero_diag_init_commands();
 }
 
