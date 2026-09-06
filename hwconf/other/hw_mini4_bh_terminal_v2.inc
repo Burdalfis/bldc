@@ -1,3 +1,20 @@
+/* Sampled-data scope overlay for the dedicated MINI4 B-H fixture.
+ *
+ * mc_interface invokes the PWM callback after the FOC/current calculations but
+ * before it copies the debug-sampling channels. Phase C is physically unused
+ * by this fixture, so while a tracer job is running replace the sampled phase-C
+ * current channel with INA282 OUT relative to its nominal 1.65 V centre.
+ *
+ * VESC Tool will still label this trace as amperes. For the B-H target only,
+ * interpret 1.000 displayed A on phase C as +1.000 V from 1.65 V at INA OUT.
+ * Raw sampled-data mode is intentionally not remapped; use normal/non-raw mode.
+ */
+static void bh_sample_scope_pwm_cb(void) {
+	if (bh_running) {
+		ADC_curr_norm_value[2] = bh_sense_out_v() - 1.65f;
+	}
+}
+
 static void terminal_bh_ctrl_print(void) {
 	const volatile mc_configuration *cfg = mc_interface_get_configuration();
 	float bw_kp = 0.0f;
@@ -172,6 +189,9 @@ static void terminal_bh_l_point(int argc, const char **argv) {
 }
 
 static void bh_init_commands(void) {
+	// Dedicated target: claim the single global PWM callback for the sampled-data
+	// scope overlay. The callback is inert unless a B-H job is actually running.
+	mc_interface_set_pwm_callback(bh_sample_scope_pwm_cb);
 	bh_init_commands_legacy();
 	terminal_register_command_callback(
 			"bh_ctrl",
