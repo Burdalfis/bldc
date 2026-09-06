@@ -47,10 +47,16 @@ static inline void bh_rtos_sleep(float seconds) {
 
 #undef timer_sleep
 
-/* Extend the command table without modifying the legacy terminal module. */
+/* Keep the legacy command callbacks, but rename its worker. The queue helper
+ * in capture.inc was compiled earlier against the original bh_thread forward
+ * declaration, so it will dispatch to the fixed worker defined below.
+ */
+#define bh_thread bh_thread_legacy
 #define bh_init_commands bh_init_commands_legacy
 #include "hw_mini4_bh_terminal.inc"
 #undef bh_init_commands
+#undef bh_thread
+#include "hw_mini4_bh_worker_v2.inc"
 #include "hw_mini4_bh_zero_diag.inc"
 
 /* Keep terminal_v2 intact: rename its initializer, then wrap it so the new
