@@ -73,6 +73,13 @@ static void bh_print_metrics(float freq, const bh_metrics_t *m, bool sweep);
 #undef bh_init_commands
 #undef bh_thread
 
+/* bh_live's wrapper dispatches the optional PWM-rate path as well. Forward
+ * declare the fast-mode state/function, compile the ordinary live wrapper,
+ * then compile the implementation once the ordinary live globals exist.
+ */
+static bool bh_fast_live_mode;
+static bool bh_fast_live_plot(float freq);
+
 /* The live wrapper needs the legacy command parser/queue helpers above and
  * must be visible before worker_v2 calls bh_run_one(). Keep its 4 kHz timing
  * loop scheduler-friendly just like the finite capture paths.
@@ -80,11 +87,12 @@ static void bh_print_metrics(float freq, const bh_metrics_t *m, bool sweep);
 #define timer_sleep(seconds) bh_rtos_sleep(seconds)
 #include "hw_mini4_bh_live.inc"
 #undef timer_sleep
+#include "hw_mini4_bh_fast.inc"
 #include "hw_mini4_bh_worker_v2.inc"
 #include "hw_mini4_bh_zero_diag.inc"
 
-/* Keep terminal_v2 intact: rename its initializer, then wrap it so the new
- * live-loop command and static bridge-state diagnostics are registered too.
+/* Keep terminal_v2 intact: rename its initializer, then wrap it so the live
+ * loop, PWM-rate live loop and static bridge-state diagnostics are registered.
  */
 #define bh_init_commands bh_init_commands_v2_base
 #include "hw_mini4_bh_terminal_v2.inc"
@@ -92,6 +100,7 @@ static void bh_print_metrics(float freq, const bh_metrics_t *m, bool sweep);
 static void bh_init_commands(void) {
     bh_init_commands_v2_base();
     bh_live_init_commands();
+    bh_fast_init_commands();
     bh_zero_diag_init_commands();
 }
 
