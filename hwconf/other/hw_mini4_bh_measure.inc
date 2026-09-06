@@ -6,16 +6,52 @@ typedef struct {
 	float vs_mean;
 } bh_ac_probe_t;
 
-static float bh_measure_sense_zero(void) {
+static bool bh_sense_zero_ok = true;
+
+static float bh_measure_sense_zero_samples(int settle_ms, int samples, int sample_us) {
+	bh_sense_zero_ok = true;
 	bh_release_locked();
-	chThdSleepMilliseconds(50);
+	bh_hold_hard_off_ms(settle_ms);
+	bh_adc_clip_reset();
+
 	double sum = 0.0;
-	const int samples = 1000;
+	int valid = 0;
 	for (int i = 0; i < samples; i++) {
-		sum += bh_sense_out_v();
-		chThdSleepMicroseconds(250);
+		if (bh_stop_requested) {
+			bh_sense_zero_ok = false;
+			break;
+		}
+
+		/* Keep the ordinary VESC motor timeout from unlocking the tracer and
+		 * replacing our true bridge-off state with an active 0-A FOC command.
+		 */
+		bh_keep_hard_off_alive();
+		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		bool hard_sample = bh_adc_sample_hard_rail(raw);
+		if (bh_adc_clipped()) {
+			bh_sense_zero_ok = false;
+			commands_printf("BH_ZERO_ABORT sustained A1 clipping raw=%u (>10 hits/s)",
+					(unsigned)raw);
+			break;
+		}
+
+		// Ignore isolated rail glitches so one bad conversion cannot bias zero.
+		if (!hard_sample) {
+			sum += bh_sense_out_v();
+			valid++;
+		}
+		chThdSleepMicroseconds(sample_us);
 	}
-	return (float)(sum / (double)samples);
+
+	if (valid <= 0) {
+		bh_sense_zero_ok = false;
+		return bh_sense_out_v();
+	}
+	return (float)(sum / (double)valid);
+}
+
+static float bh_measure_sense_zero(void) {
+	return bh_measure_sense_zero_samples(50, 1000, 250);
 }
 
 static bool bh_measure_ac_search_once(float ac_current, float freq,
@@ -32,6 +68,7 @@ static bool bh_measure_ac_search_once(float ac_current, float freq,
 	double vs_s = 0.0, vs_c = 0.0;
 	double i_dc = 0.0, vs_dc = 0.0;
 	double s_sum = 0.0, c_sum = 0.0, wsum = 0.0;
+	bh_adc_clip_reset();
 
 	while (!bh_stop_requested) {
 		uint32_t loop_start = timer_time_now();
@@ -47,8 +84,16 @@ static bool bh_measure_ac_search_once(float ac_current, float freq,
 		float dt = timer_calc_diff(t_prev, sample_now);
 		t_prev = sample_now;
 		float i_now = bh_coil_current();
+		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		bool hard_sample = bh_adc_sample_hard_rail(raw);
 		float vs_now = (bh_sense_out_v() - sense_zero) / BH_INA_GAIN;
-		if (t >= measure_start && dt > 0.0f && dt < 0.01f) {
+		if (bh_adc_clipped()) {
+			commands_printf("BH_RL_ABORT sustained A1 clipping raw=%u (>10 hits/s)",
+					(unsigned)raw);
+			bh_release_locked();
+			return false;
+		}
+		if (!hard_sample && t >= measure_start && dt > 0.0f && dt < 0.01f) {
 			float s = sinf(ph);
 			float c = cosf(ph);
 			i_s += (double)i_now * s * dt;
@@ -62,11 +107,6 @@ static bool bh_measure_ac_search_once(float ac_current, float freq,
 			wsum += dt;
 		}
 
-		if (bh_adc_clipped()) {
-			commands_printf("BH_RL_ABORT A1 clipping raw=%u", (unsigned)ADC_Value[ADC_IND_EXT]);
-			bh_release_locked();
-			return false;
-		}
 		mc_fault_code fault = mc_interface_get_fault();
 		if (fault != FAULT_CODE_NONE) {
 			commands_printf("BH_RL_ABORT fault=%d (%s)", (int)fault,
@@ -155,11 +195,10 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 			(double)(r_line * 1e3f), (double)v_offset);
 
 	bh_release_locked();
-	chThdSleepMilliseconds(20);
+	bh_hold_hard_off_ms(20);
 	float sense_zero = bh_measure_sense_zero();
-	if (bh_adc_clipped()) {
-		commands_printf("BH_RL_ABORT A1 zero near rail raw=%u V=%.6f",
-				(unsigned)ADC_Value[ADC_IND_EXT], (double)sense_zero);
+	if (!bh_sense_zero_ok) {
+		commands_printf("BH_RL_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
 		return false;
 	}
 
@@ -169,7 +208,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 	commands_printf("BH_RL_STAGE AC_PROBE A1zero=%.7f V", (double)sense_zero);
 	bh_set_measurement_gains(cfg, r_line);
 	mc_interface_set_configuration(cfg);
-	chThdSleepMilliseconds(50);
+	bh_hold_hard_off_ms(50);
 	bh_ac_probe_t probe;
 	if (!bh_measure_ac_search_once(ac_current, freq, sense_zero, &probe)) {
 		return false;
@@ -201,7 +240,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 	cfg->foc_current_kp = kp;
 	cfg->foc_current_ki = ki;
 	mc_interface_set_configuration(cfg);
-	chThdSleepMilliseconds(50);
+	bh_hold_hard_off_ms(50);
 	commands_printf("BH_RL_STAGE AC_TUNED Kp=%.7f Ki=%.7f BW=%.1f Hz",
 			(double)kp, (double)ki, (double)bw);
 
@@ -242,6 +281,7 @@ static bool bh_precondition_and_offset(float freq, bool sine_wave, float sense_z
 	uint32_t t_prev = t0;
 	double vs_dt = 0.0;
 	double dt_sum = 0.0;
+	bh_adc_clip_reset();
 
 	while (!bh_stop_requested) {
 		uint32_t loop_start = timer_time_now();
@@ -255,16 +295,19 @@ static bool bh_precondition_and_offset(float freq, bool sine_wave, float sense_z
 		uint32_t now = timer_time_now();
 		float dt = timer_calc_diff(t_prev, now);
 		t_prev = now;
-		if (t >= mean_start && dt > 0.0f && dt < 0.02f) {
+		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		bool hard_sample = bh_adc_sample_hard_rail(raw);
+		if (bh_adc_clipped()) {
+			commands_printf("BH_ABORT sustained A1 clipping raw=%u (>10 hits/s)",
+					(unsigned)raw);
+			return false;
+		}
+		if (!hard_sample && t >= mean_start && dt > 0.0f && dt < 0.02f) {
 			float vs = (bh_sense_out_v() - sense_zero) / BH_INA_GAIN;
 			vs_dt += (double)vs * dt;
 			dt_sum += dt;
 		}
 
-		if (bh_adc_clipped()) {
-			commands_printf("BH_ABORT A1 clipping raw=%u", (unsigned)ADC_Value[ADC_IND_EXT]);
-			return false;
-		}
 		mc_fault_code fault = mc_interface_get_fault();
 		if (fault != FAULT_CODE_NONE) {
 			commands_printf("BH_ABORT fault=%d (%s)", (int)fault,
