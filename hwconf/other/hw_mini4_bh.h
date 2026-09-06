@@ -66,9 +66,12 @@ static inline void bh_rtos_sleep(float seconds) {
 #undef bh_thread
 
 /* The live wrapper needs the legacy command parser/queue helpers above and
- * must be visible before worker_v2 calls bh_run_one().
+ * must be visible before worker_v2 calls bh_run_one(). Keep its 4 kHz timing
+ * loop scheduler-friendly just like the finite capture paths.
  */
+#define timer_sleep(seconds) bh_rtos_sleep(seconds)
 #include "hw_mini4_bh_live.inc"
+#undef timer_sleep
 #include "hw_mini4_bh_worker_v2.inc"
 #include "hw_mini4_bh_zero_diag.inc"
 
