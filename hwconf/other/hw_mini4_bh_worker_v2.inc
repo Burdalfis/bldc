@@ -33,12 +33,28 @@ static THD_FUNCTION(bh_thread, arg) {
 		utils_sys_unlock_cnt();
 		commands_printf("BH_WDT slow mode active for tracer job");
 
+		/* The ordinary VESC command timeout is intended to stop a motor when its
+		 * command source disappears. A tracer job is itself the command source,
+		 * and long plot/sample transmissions can legitimately keep this worker
+		 * away from timeout_reset() for longer than the user's configured motor
+		 * timeout. Save the setting, disable only the age timeout for the duration
+		 * of the job, and retain the configured kill-switch mode. The IWDG remains
+		 * active independently, and VESC Tool Stop/fault paths still work.
+		 */
+		systime_t timeout_old_msec = timeout_get_timeout_msec();
+		float timeout_old_brake = timeout_get_brake_current();
+		KILL_SW_MODE timeout_old_ksw = timeout_get_kill_sw_mode();
+		timeout_configure(0, timeout_old_brake, timeout_old_ksw);
+		timeout_reset();
+
 		mc_configuration *cfg_old = mempools_alloc_mcconf();
 		mc_configuration *cfg = mempools_alloc_mcconf();
 		if (!cfg_old || !cfg) {
 			commands_printf("BH_ABORT could not allocate motor configuration");
 			if (cfg) mempools_free_mcconf(cfg);
 			if (cfg_old) mempools_free_mcconf(cfg_old);
+			timeout_configure(timeout_old_msec, timeout_old_brake, timeout_old_ksw);
+			timeout_reset();
 			utils_sys_lock_cnt();
 			timeout_configure_IWDT();
 			utils_sys_unlock_cnt();
@@ -51,10 +67,9 @@ static THD_FUNCTION(bh_thread, arg) {
 		*cfg = *cfg_old;
 
 		/* Critical ordering: block all ordinary control commands before the
-		 * cc_min_current=0 tracer config can become active. The normal VESC motor
-		 * timeout itself can call mc_interface_unlock() and command 0-A braking,
-		 * so start feeding it before taking ownership and keep feeding it during
-		 * every intentional bridge-off dwell.
+		 * cc_min_current=0 tracer config can become active. Keep feeding timeout
+		 * calls in the existing helpers as harmless bookkeeping even though the
+		 * age timeout itself is disabled for the job.
 		 */
 		timeout_reset();
 		bh_release_locked();
@@ -121,6 +136,13 @@ static THD_FUNCTION(bh_thread, arg) {
 
 		mempools_free_mcconf(cfg);
 		mempools_free_mcconf(cfg_old);
+
+		/* Restore the user's normal command timeout only after the original motor
+		 * configuration is back and the bridge is hard-off. Reset its age so the
+		 * freshly restored timeout cannot fire immediately on worker exit.
+		 */
+		timeout_configure(timeout_old_msec, timeout_old_brake, timeout_old_ksw);
+		timeout_reset();
 
 		utils_sys_lock_cnt();
 		timeout_configure_IWDT();
