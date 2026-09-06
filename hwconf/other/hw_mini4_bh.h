@@ -89,10 +89,11 @@ static bool bh_fast_live_plot(float freq);
 #undef timer_sleep
 #include "hw_mini4_bh_fast.inc"
 #include "hw_mini4_bh_worker_v2.inc"
-#include "hw_mini4_bh_zero_diag.inc"
 
 /* Keep terminal_v2 intact: rename its initializer, then wrap it so the live
- * loop, PWM-rate live loop and static bridge-state diagnostics are registered.
+ * and PWM-rate live commands are registered too. The old zero-state diagnostic
+ * commands were useful while debugging timeout/PWM behavior, but that issue is
+ * now understood and fixed; leaving them linked costs precious MINI4 flash.
  */
 #define bh_init_commands bh_init_commands_v2_base
 #include "hw_mini4_bh_terminal_v2.inc"
@@ -101,7 +102,6 @@ static void bh_init_commands(void) {
     bh_init_commands_v2_base();
     bh_live_init_commands();
     bh_fast_init_commands();
-    bh_zero_diag_init_commands();
 }
 
 #undef bh_set_measurement_gains
