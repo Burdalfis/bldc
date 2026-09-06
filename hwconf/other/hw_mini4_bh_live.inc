@@ -21,9 +21,8 @@ static bool bh_live_suppress_metric = false;
 
 static bool bh_live_plot(float freq) {
 	float sense_zero = bh_measure_sense_zero();
-	if (bh_adc_clipped()) {
-		commands_printf("BH_LIVE_ABORT A1 zero near rail raw=%u V=%.6f",
-				(unsigned)ADC_Value[ADC_IND_EXT], (double)sense_zero);
+	if (!bh_sense_zero_ok) {
+		commands_printf("BH_LIVE_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
 		return false;
 	}
 
@@ -59,6 +58,7 @@ static bool bh_live_plot(float freq) {
 	bool seen_running = mc_interface_get_state() == MC_STATE_RUNNING;
 	bool external_stop = false;
 	uint32_t last_plot_start = timer_time_now();
+	bh_adc_clip_reset();
 
 	while (!bh_stop_requested) {
 		bool plot_this_cycle = first_plot ||
@@ -93,25 +93,29 @@ static bool bh_live_plot(float freq) {
 			t_prev = now;
 			float i_now = bh_coil_current();
 			uint16_t raw = ADC_Value[ADC_IND_EXT];
+			bool hard_sample = bh_adc_sample_hard_rail(raw);
 			float vs = (bh_sense_out_v() - sense_zero) / BH_INA_GAIN - sense_mean;
 			float h = BH_EXC_TURNS * i_now / bh_path_m;
 
-			if (!first_sample && dt > 0.0f && dt < 0.02f) {
-				b_live += 0.5f * (vs + last_vs) * dt /
-						(BH_SENSE_TURNS * bh_area_m2);
-			}
-			first_sample = false;
-			last_vs = vs;
-
-			if (plot_this_cycle && (sample_n % plot_div) == 0) {
-				commands_send_plot_points(h, b_live);
-			}
-
-			if (raw < BH_A1_RAW_MIN || raw > BH_A1_RAW_MAX) {
-				commands_printf("BH_LIVE_ABORT A1 clipping raw=%u at f=%.6f Hz",
+			if (bh_adc_clipped()) {
+				commands_printf("BH_LIVE_ABORT sustained A1 clipping raw=%u at f=%.6f Hz (>10 hits/s)",
 						(unsigned)raw, (double)freq);
 				bh_release_locked();
 				return false;
+			}
+
+			// Drop isolated hard-rail conversions rather than integrating their spike.
+			if (!hard_sample) {
+				if (!first_sample && dt > 0.0f && dt < 0.02f) {
+					b_live += 0.5f * (vs + last_vs) * dt /
+							(BH_SENSE_TURNS * bh_area_m2);
+				}
+				first_sample = false;
+				last_vs = vs;
+			}
+
+			if (plot_this_cycle && (sample_n % plot_div) == 0) {
+				commands_send_plot_points(h, b_live);
 			}
 
 			mc_fault_code fault = mc_interface_get_fault();
