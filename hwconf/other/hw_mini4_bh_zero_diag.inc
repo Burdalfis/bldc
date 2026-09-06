@@ -1,20 +1,21 @@
-/* Static excitation-winding zero-state diagnostics for the MINI4 B-H fixture.
+/* Static and active zero-state diagnostics for the MINI4 B-H fixture.
  *
- * The excitation winding is connected between phase outputs P1 and P2. When
- * the bridge is released both ends of that winding float. This diagnostic can
- * instead turn on one or both low-side MOSFETs while keeping every high-side
- * MOSFET off, then quantify the INA282/A1 noise in each state.
+ * The excitation winding is connected between phase outputs P1 and P2. This
+ * diagnostic compares several genuinely static bridge states with the state
+ * produced by the normal FOC current controller at a commanded 0 A.
  *
- * This deliberately mirrors VESC FOC's stop_pwm_hw/full_brake_hw timer setup:
- * forced inactive main output means high side OFF; enabling the complementary
- * output turns the corresponding low-side MOSFET ON. Phase C remains off.
+ * The active FOC-zero case is important because the tracer sets
+ * cc_min_current=0. In VESC FOC that means an exact zero-current command still
+ * enters MC_STATE_RUNNING and enables normal PWM modulation. Thus "0 A" is not
+ * the same electrical state as all FETs off.
  */
 
 typedef enum {
 	BH_ZERO_FLOAT = 0,
 	BH_ZERO_P1_GND,
 	BH_ZERO_P2_GND,
-	BH_ZERO_BOTH_GND
+	BH_ZERO_BOTH_GND,
+	BH_ZERO_FOC_ZERO
 } bh_zero_mode_t;
 
 static const char *bh_zero_mode_name(bh_zero_mode_t mode) {
@@ -23,19 +24,26 @@ static const char *bh_zero_mode_name(bh_zero_mode_t mode) {
 	case BH_ZERO_P1_GND: return "p1_gnd";
 	case BH_ZERO_P2_GND: return "p2_gnd";
 	case BH_ZERO_BOTH_GND: return "both_gnd";
+	case BH_ZERO_FOC_ZERO: return "foc_zero";
 	default: return "unknown";
 	}
 }
 
 static void bh_zero_force_mode(bh_zero_mode_t mode) {
-	/* Put FOC's internal PWM state into the normal disabled state first. This
-	 * also guarantees all three high/low outputs are off before we selectively
-	 * enable any low side below. The internal mode remains disabled, so the
-	 * next ordinary FOC command will restart PWM normally.
-	 */
+	/* Always start from the real FOC-off state. */
 	mcpwm_foc_stop_pwm(false);
 
 	if (mode == BH_ZERO_FLOAT) {
+		return;
+	}
+
+	if (mode == BH_ZERO_FOC_ZERO) {
+		/* bh_apply_current() uses the same locked-command path as the actual
+		 * tracer. With the temporary tracer config below cc_min_current is 0,
+		 * therefore this exact-zero command intentionally enters RUNNING and
+		 * starts the ordinary FOC PWM zero-vector modulation.
+		 */
+		bh_apply_current(0.0f);
 		return;
 	}
 
@@ -74,9 +82,10 @@ typedef struct {
 	float rms_v;
 	float mean_icoil;
 	int samples;
+	int running_samples;
 } bh_zero_stats_t;
 
-static void bh_zero_collect_stats(int hold_ms, bh_zero_stats_t *st) {
+static void bh_zero_collect_stats(bh_zero_mode_t mode, int hold_ms, bh_zero_stats_t *st) {
 	memset(st, 0, sizeof(*st));
 	st->raw_min = 4095;
 	st->raw_max = 0;
@@ -87,6 +96,14 @@ static void bh_zero_collect_stats(int hold_ms, bh_zero_stats_t *st) {
 	uint32_t t0 = timer_time_now();
 
 	while (timer_seconds_elapsed_since(t0) < (float)hold_ms * 1e-3f) {
+		/* Reissue active zero at roughly the same cadence as the tracer loops.
+		 * This both keeps the timeout alive and reproduces the actual command
+		 * path instead of merely leaving a stale control mode running.
+		 */
+		if (mode == BH_ZERO_FOC_ZERO) {
+			bh_apply_current(0.0f);
+		}
+
 		uint16_t raw = ADC_Value[ADC_IND_EXT];
 		float v = bh_sense_out_v();
 		float i = bh_coil_current();
@@ -95,6 +112,9 @@ static void bh_zero_collect_stats(int hold_ms, bh_zero_stats_t *st) {
 		sum_v += v;
 		sum_v2 += (double)v * v;
 		sum_i += i;
+		if (mc_interface_get_state() == MC_STATE_RUNNING) {
+			st->running_samples++;
+		}
 		st->samples++;
 		chThdSleepMicroseconds(200);
 	}
@@ -112,8 +132,10 @@ static void bh_zero_collect_stats(int hold_ms, bh_zero_stats_t *st) {
 static void bh_zero_print_stats(bh_zero_mode_t mode, const bh_zero_stats_t *st) {
 	float vmin = (float)st->raw_min * (3.3f / 4095.0f);
 	float vmax = (float)st->raw_max * (3.3f / 4095.0f);
-	commands_printf("BH_ZERO_RESULT mode=%s samples=%d A1mean=%.7f V A1rms=%.7f V A1min=%u(%.6f V) A1max=%u(%.6f V) A1pp=%.6f V Icoil_mean=%.6f A",
-			bh_zero_mode_name(mode), st->samples,
+	float running_pct = st->samples > 0 ?
+			100.0f * (float)st->running_samples / (float)st->samples : 0.0f;
+	commands_printf("BH_ZERO_RESULT mode=%s samples=%d running=%.1f%% A1mean=%.7f V A1rms=%.7f V A1min=%u(%.6f V) A1max=%u(%.6f V) A1pp=%.6f V Icoil_mean=%.6f A",
+			bh_zero_mode_name(mode), st->samples, (double)running_pct,
 			(double)st->mean_v, (double)st->rms_v,
 			(unsigned)st->raw_min, (double)vmin,
 			(unsigned)st->raw_max, (double)vmax,
@@ -129,6 +151,8 @@ static bool bh_zero_parse_mode(const char *s, bh_zero_mode_t *mode) {
 		*mode = BH_ZERO_P2_GND;
 	} else if (!strcmp(s, "both") || !strcmp(s, "both_gnd")) {
 		*mode = BH_ZERO_BOTH_GND;
+	} else if (!strcmp(s, "foc") || !strcmp(s, "foc0") || !strcmp(s, "foc_zero")) {
+		*mode = BH_ZERO_FOC_ZERO;
 	} else {
 		return false;
 	}
@@ -142,8 +166,45 @@ static void bh_zero_run_one(bh_zero_mode_t mode, int hold_ms) {
 	 */
 	chThdSleepMilliseconds(10);
 	bh_zero_stats_t st;
-	bh_zero_collect_stats(hold_ms, &st);
+	bh_zero_collect_stats(mode, hold_ms, &st);
 	bh_zero_print_stats(mode, &st);
+}
+
+/* Apply the same core FOC settings used by a real tracer job while the motor is
+ * already locked. This removes ordinary app/CAN commands from the experiment
+ * and guarantees cc_min_current=0 for the active-zero state.
+ */
+static bool bh_zero_prepare_cfg(mc_configuration **old_out, mc_configuration **test_out) {
+	mc_configuration *old_cfg = mempools_alloc_mcconf();
+	mc_configuration *test_cfg = mempools_alloc_mcconf();
+	if (!old_cfg || !test_cfg) {
+		if (old_cfg) mempools_free_mcconf(old_cfg);
+		if (test_cfg) mempools_free_mcconf(test_cfg);
+		commands_printf("BH_ZERO_ABORT could not allocate motor configuration");
+		return false;
+	}
+
+	*old_cfg = *mc_interface_get_configuration();
+	*test_cfg = *old_cfg;
+	bh_common_cfg(test_cfg, 1.0f);
+
+	mc_interface_lock();
+	mcpwm_foc_stop_pwm(false);
+	mc_interface_set_configuration(test_cfg);
+	chThdSleepMilliseconds(20);
+
+	*old_out = old_cfg;
+	*test_out = test_cfg;
+	return true;
+}
+
+static void bh_zero_restore_cfg(mc_configuration *old_cfg, mc_configuration *test_cfg) {
+	mcpwm_foc_stop_pwm(false);
+	chThdSleepMilliseconds(5);
+	mc_interface_set_configuration(old_cfg);
+	mc_interface_unlock();
+	mempools_free_mcconf(test_cfg);
+	mempools_free_mcconf(old_cfg);
 }
 
 static void terminal_bh_zero_test(int argc, const char **argv) {
@@ -157,7 +218,7 @@ static void terminal_bh_zero_test(int argc, const char **argv) {
 		hold_ms = atoi(argv[1]);
 	} else if (argc != 1) {
 		commands_printf("Usage: bh_zero_test [hold_ms]");
-		commands_printf("Runs float, P1-low, P2-low and both-low states; default 250 ms each.");
+		commands_printf("Runs float, P1-low, P2-low, both-low and active FOC-zero states; default 250 ms each.");
 		return;
 	}
 	if (hold_ms < 20 || hold_ms > 2000) {
@@ -166,22 +227,29 @@ static void terminal_bh_zero_test(int argc, const char **argv) {
 	}
 
 	commands_printf("BH_ZERO_TEST_START hold=%d ms/state", hold_ms);
-	commands_printf("Modes: float=all FETs off; p1_gnd=P1 low-side on; p2_gnd=P2 low-side on; both_gnd=P1+P2 low-sides on.");
+	commands_printf("Modes: float=all FETs off; p1_gnd=P1 low-side on; p2_gnd=P2 low-side on; both_gnd=P1+P2 low-sides on; foc_zero=0 A command with normal 30 kHz FOC PWM active.");
 
 	/* Reuse bh_running so the existing Sampled Data phase-C overlay continues to
-	 * show A1 while this diagnostic is active. No excitation current is commanded.
+	 * show A1 while this diagnostic is active.
 	 */
 	bh_running = true;
 	bh_stop_requested = false;
-	mc_interface_lock();
+
+	mc_configuration *old_cfg = 0;
+	mc_configuration *test_cfg = 0;
+	if (!bh_zero_prepare_cfg(&old_cfg, &test_cfg)) {
+		bh_running = false;
+		return;
+	}
 
 	bh_zero_run_one(BH_ZERO_FLOAT, hold_ms);
 	bh_zero_run_one(BH_ZERO_P1_GND, hold_ms);
 	bh_zero_run_one(BH_ZERO_P2_GND, hold_ms);
 	bh_zero_run_one(BH_ZERO_BOTH_GND, hold_ms);
+	bh_zero_run_one(BH_ZERO_FOC_ZERO, hold_ms);
 
 	bh_zero_force_mode(BH_ZERO_FLOAT);
-	mc_interface_unlock();
+	bh_zero_restore_cfg(old_cfg, test_cfg);
 	bh_running = false;
 	commands_printf("BH_ZERO_TEST_DONE bridge released");
 }
@@ -192,12 +260,12 @@ static void terminal_bh_zero_hold(int argc, const char **argv) {
 		return;
 	}
 	if (argc != 3) {
-		commands_printf("Usage: bh_zero_hold <float|p1|p2|both> <hold_ms>");
+		commands_printf("Usage: bh_zero_hold <float|p1|p2|both|foc> <hold_ms>");
 		return;
 	}
 	bh_zero_mode_t mode;
 	if (!bh_zero_parse_mode(argv[1], &mode)) {
-		commands_printf("Unknown zero mode. Use float, p1, p2 or both.");
+		commands_printf("Unknown zero mode. Use float, p1, p2, both or foc.");
 		return;
 	}
 	int hold_ms = atoi(argv[2]);
@@ -208,11 +276,18 @@ static void terminal_bh_zero_hold(int argc, const char **argv) {
 
 	bh_running = true;
 	bh_stop_requested = false;
-	mc_interface_lock();
+
+	mc_configuration *old_cfg = 0;
+	mc_configuration *test_cfg = 0;
+	if (!bh_zero_prepare_cfg(&old_cfg, &test_cfg)) {
+		bh_running = false;
+		return;
+	}
+
 	commands_printf("BH_ZERO_HOLD mode=%s hold=%d ms", bh_zero_mode_name(mode), hold_ms);
 	bh_zero_run_one(mode, hold_ms);
 	bh_zero_force_mode(BH_ZERO_FLOAT);
-	mc_interface_unlock();
+	bh_zero_restore_cfg(old_cfg, test_cfg);
 	bh_running = false;
 	commands_printf("BH_ZERO_HOLD_DONE bridge released");
 }
@@ -220,12 +295,12 @@ static void terminal_bh_zero_hold(int argc, const char **argv) {
 static void bh_zero_diag_init_commands(void) {
 	terminal_register_command_callback(
 			"bh_zero_test",
-			"Compare INA/A1 noise with excitation winding floating, one end grounded, or both ends grounded by low-side FETs.",
+			"Compare INA/A1 noise with static excitation states and active 0-A FOC PWM.",
 			"[hold_ms]",
 			terminal_bh_zero_test);
 	terminal_register_command_callback(
 			"bh_zero_hold",
-			"Hold one static excitation-winding zero state and report INA/A1 noise statistics.",
-			"<float|p1|p2|both> <hold_ms>",
+			"Hold one excitation zero state and report INA/A1 noise plus RUNNING-state fraction.",
+			"<float|p1|p2|both|foc> <hold_ms>",
 			terminal_bh_zero_hold);
 }
