@@ -26,6 +26,23 @@ static void bh_keep_programmed_run_gains(mc_configuration *cfg) {
 	(void)cfg;
 }
 
+/* The generic FOC "release motor" path does not mean "state OFF right now".
+ * It asks the FOC controller to release, which can leave MC_STATE_RUNNING set
+ * while the release state is being processed. That is fine for a normal ESC,
+ * but it is bad for this fixture for two reasons:
+ *   1. Sampled Data's motor-start trigger keys directly off MC_STATE_RUNNING.
+ *   2. We need the excitation winding genuinely undriven while measuring A1
+ *      zero, not merely commanded to zero current.
+ *
+ * Every downstream tracer call that says bh_release_locked() therefore gets a
+ * hard FOC PWM stop instead. mcpwm_foc_stop_pwm() sets control mode NONE,
+ * state OFF and disables the bridge immediately. The worker already owns the
+ * motor lock while these calls are made.
+ */
+static void bh_release_hard_off(void) {
+	mcpwm_foc_stop_pwm(false);
+}
+
 static float bh_programmed_current_bw_hz(void) {
 	const volatile mc_configuration *cfg = mc_interface_get_configuration();
 	float sum = 0.0f;
@@ -60,3 +77,4 @@ static float bh_programmed_current_bw_hz(void) {
 
 #define bh_set_measurement_gains bh_keep_programmed_measurement_gains
 #define bh_set_run_gains bh_keep_programmed_run_gains
+#define bh_release_locked bh_release_hard_off
