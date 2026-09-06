@@ -2,9 +2,8 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 		bool print_raw, bh_metrics_t *m) {
 	memset(m, 0, sizeof(*m));
 	float sense_zero = bh_measure_sense_zero();
-	if (bh_adc_clipped()) {
-		commands_printf("BH_ABORT A1 zero is near a rail: raw=%u, V=%.6f",
-				(unsigned)ADC_Value[ADC_IND_EXT], (double)sense_zero);
+	if (!bh_sense_zero_ok) {
+		commands_printf("BH_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
 		return false;
 	}
 
@@ -49,6 +48,7 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 	double vhc[BH_MAX_HARMONIC + 1] = {0};
 	double i_s = 0.0, i_c = 0.0;
 	int sample_n = 0;
+	bh_adc_clip_reset();
 
 	int max_h = (int)(BH_SAMPLE_HZ / (4.0f * freq));
 	if (max_h > BH_MAX_HARMONIC) {
@@ -74,56 +74,69 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 		t_prev = now;
 		float i_now = bh_coil_current();
 		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		bool hard_sample = bh_adc_sample_hard_rail(raw);
 		float a1_v = bh_sense_out_v();
 		float vs = (a1_v - sense_zero) / BH_INA_GAIN - sense_mean;
 		float h = BH_EXC_TURNS * i_now / bh_path_m;
 
-		if (!first && dt > 0.0f && dt < 0.02f) {
-			b_live += 0.5f * (vs + last_vs) * dt /
-					(BH_SENSE_TURNS * bh_area_m2);
+		if (bh_adc_clipped()) {
+			commands_printf("BH_ABORT sustained A1 clipping raw=%u at f=%.6f Hz (>10 hits/s)",
+					(unsigned)raw, (double)freq);
+			return false;
 		}
-		first = false;
-		last_vs = vs;
 
-		if (t >= metric_start) {
-			if (!metric_started) {
-				metric_started = true;
-				metric_first = true;
-				b_metric = 0.0f;
-				last_vs_metric = vs;
-				last_h_metric = h;
-				last_b_metric = 0.0f;
-			}
-			if (!metric_first && dt > 0.0f && dt < 0.02f) {
-				b_metric += 0.5f * (vs + last_vs_metric) * dt /
+		/* A rare hard-rail conversion is treated as an ADC glitch: leave B where
+		 * it was and exclude that sample from metrics/harmonics. Persistent rail
+		 * contact still aborts through the rolling rate guard above.
+		 */
+		if (!hard_sample) {
+			if (!first && dt > 0.0f && dt < 0.02f) {
+				b_live += 0.5f * (vs + last_vs) * dt /
 						(BH_SENSE_TURNS * bh_area_m2);
-				loop_area += 0.5 * ((double)h + last_h_metric) *
-						((double)b_metric - last_b_metric);
-				if (!have_br_mid && ((last_h_metric > 0.0f && h <= 0.0f) ||
-						(last_h_metric < 0.0f && h >= 0.0f))) {
-					float denom_h = h - last_h_metric;
-					if (fabsf(denom_h) > 1e-12f) {
-						float a = -last_h_metric / denom_h;
-						br_mid = last_b_metric + a * (b_metric - last_b_metric);
-						have_br_mid = true;
+			}
+			first = false;
+			last_vs = vs;
+
+			if (t >= metric_start) {
+				if (!metric_started) {
+					metric_started = true;
+					metric_first = true;
+					b_metric = 0.0f;
+					last_vs_metric = vs;
+					last_h_metric = h;
+					last_b_metric = 0.0f;
+				}
+				if (!metric_first && dt > 0.0f && dt < 0.02f) {
+					b_metric += 0.5f * (vs + last_vs_metric) * dt /
+							(BH_SENSE_TURNS * bh_area_m2);
+					loop_area += 0.5 * ((double)h + last_h_metric) *
+							((double)b_metric - last_b_metric);
+					if (!have_br_mid && ((last_h_metric > 0.0f && h <= 0.0f) ||
+							(last_h_metric < 0.0f && h >= 0.0f))) {
+						float denom_h = h - last_h_metric;
+						if (fabsf(denom_h) > 1e-12f) {
+							float a = -last_h_metric / denom_h;
+							br_mid = last_b_metric + a * (b_metric - last_b_metric);
+							have_br_mid = true;
+						}
 					}
 				}
-			}
-			metric_first = false;
-			last_vs_metric = vs;
-			last_h_metric = h;
-			last_b_metric = b_metric;
-			b_min = fminf(b_min, b_metric);
-			b_max = fmaxf(b_max, b_metric);
-			h_pk = fmaxf(h_pk, fabsf(h));
+				metric_first = false;
+				last_vs_metric = vs;
+				last_h_metric = h;
+				last_b_metric = b_metric;
+				b_min = fminf(b_min, b_metric);
+				b_max = fmaxf(b_max, b_metric);
+				h_pk = fmaxf(h_pk, fabsf(h));
 
-			float ang = 2.0f * M_PI * (phase01 - floorf(phase01));
-			for (int n = 1; n <= max_h; n++) {
-				vhs[n] += (double)vs * sinf((float)n * ang) * dt;
-				vhc[n] += (double)vs * cosf((float)n * ang) * dt;
+				float ang = 2.0f * M_PI * (phase01 - floorf(phase01));
+				for (int n = 1; n <= max_h; n++) {
+					vhs[n] += (double)vs * sinf((float)n * ang) * dt;
+					vhc[n] += (double)vs * cosf((float)n * ang) * dt;
+				}
+				i_s += (double)i_now * sinf(ang) * dt;
+				i_c += (double)i_now * cosf(ang) * dt;
 			}
-			i_s += (double)i_now * sinf(ang) * dt;
-			i_c += (double)i_now * cosf(ang) * dt;
 		}
 
 		if ((sample_n % plot_div) == 0) {
@@ -136,10 +149,6 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 			}
 		}
 
-		if (raw < BH_A1_RAW_MIN || raw > BH_A1_RAW_MAX) {
-			commands_printf("BH_ABORT A1 clipping raw=%u at f=%.6f Hz", (unsigned)raw, (double)freq);
-			return false;
-		}
 		mc_fault_code fault = mc_interface_get_fault();
 		if (fault != FAULT_CODE_NONE) {
 			commands_printf("BH_ABORT fault=%d (%s) at f=%.6f Hz", (int)fault,
@@ -203,6 +212,7 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 	bool afirst = true;
 	double hc_sum = 0.0;
 	int hc_n = 0;
+	bh_adc_clip_reset();
 	while (!bh_stop_requested) {
 		uint32_t loop_start = timer_time_now();
 		float t = timer_seconds_elapsed_since(a0);
@@ -214,28 +224,37 @@ static bool bh_capture_frequency(float freq, int cycles, bool sine_wave,
 		uint32_t now = timer_time_now();
 		float dt = timer_calc_diff(aprev, now);
 		aprev = now;
+		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		bool hard_sample = bh_adc_sample_hard_rail(raw);
 		float vs = (bh_sense_out_v() - sense_zero) / BH_INA_GAIN - sense_mean;
 		float h = BH_EXC_TURNS * bh_coil_current() / bh_path_m;
-		if (!afirst && dt > 0.0f && dt < 0.02f) {
-			ba += 0.5f * (vs + last_vsa) * dt /
-					(BH_SENSE_TURNS * bh_area_m2);
-			float y0 = last_ba - b_center;
-			float y1 = ba - b_center;
-			if ((y0 > 0.0f && y1 <= 0.0f) || (y0 < 0.0f && y1 >= 0.0f)) {
-				float dy = y1 - y0;
-				if (fabsf(dy) > 1e-12f) {
-					float a = -y0 / dy;
-					float hc = last_ha + a * (h - last_ha);
-					hc_sum += fabsf(hc);
-					hc_n++;
+		if (bh_adc_clipped()) {
+			commands_printf("BH_ABORT sustained A1 clipping during Hc cycle raw=%u (>10 hits/s)",
+					(unsigned)raw);
+			return false;
+		}
+		if (!hard_sample) {
+			if (!afirst && dt > 0.0f && dt < 0.02f) {
+				ba += 0.5f * (vs + last_vsa) * dt /
+						(BH_SENSE_TURNS * bh_area_m2);
+				float y0 = last_ba - b_center;
+				float y1 = ba - b_center;
+				if ((y0 > 0.0f && y1 <= 0.0f) || (y0 < 0.0f && y1 >= 0.0f)) {
+					float dy = y1 - y0;
+					if (fabsf(dy) > 1e-12f) {
+						float a = -y0 / dy;
+						float hc = last_ha + a * (h - last_ha);
+						hc_sum += fabsf(hc);
+						hc_n++;
+					}
 				}
 			}
+			afirst = false;
+			last_vsa = vs;
+			last_ba = ba;
+			last_ha = h;
 		}
-		afirst = false;
-		last_vsa = vs;
-		last_ba = ba;
-		last_ha = h;
-		if (bh_adc_clipped() || mc_interface_get_fault() != FAULT_CODE_NONE) {
+		if (mc_interface_get_fault() != FAULT_CODE_NONE) {
 			return false;
 		}
 		float elapsed = timer_seconds_elapsed_since(loop_start);
@@ -269,7 +288,7 @@ static bool bh_run_one(float freq, bool sine_wave, bool print_raw, bh_metrics_t 
 	bool ok = bh_capture_frequency(freq, bh_cycles, sine_wave, print_raw, m);
 	bh_apply_current(0.0f);
 	bh_release_locked();
-	chThdSleepMilliseconds(20);
+	bh_hold_hard_off_ms(20);
 	return ok;
 }
 
