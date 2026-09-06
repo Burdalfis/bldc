@@ -3,13 +3,26 @@
  * This path deliberately does not replace the existing current-controlled
  * bh_live implementation. It is an experimental A/B path that:
  *   - generates the requested triangle at the FOC/PWM callback rate,
- *   - drives the fixed A-B winding from a line model V = R*I + L*dI/dt,
- *   - uses open-loop duty at a fixed q-axis angle so the voltage vector lies
- *     on the same physical A-B axis as the ordinary -30 degree d-axis tracer,
- *   - slowly trims model voltage from measured cycle peak current,
- *   - samples current and A1 at the PWM callback rate,
+ *   - drives the phase-1/phase-2 fixture winding directly from
+ *         Vab = Rline * Iref + Lline * dIref/dt
+ *     plus a deliberately weak proportional current-error correction,
+ *   - applies that voltage as centered differential PWM directly to TIM1
+ *     rather than routing it back through VESC's duty/current controller,
+ *   - slowly trims the model voltage from measured cycle current amplitude,
+ *   - samples phase current and A1 at the PWM callback rate,
  *   - median-rejects isolated one-sample A1 impulses before B integration,
  *   - closes and centers each plotted B loop cycle-wise in the thread.
+ *
+ * Why direct TIM1 compare updates?
+ * -------------------------------
+ * CONTROL_MODE_OPENLOOP_DUTY_PHASE is not a raw voltage output in VESC FOC.
+ * It still uses the duty/current-control machinery to reach the requested
+ * modulation. That is exactly the extra closed-loop behavior this diagnostic
+ * is trying to remove. MINI4 has three phase shunts and a conventional TIM1
+ * complementary PWM bridge, so while this hardware-specific tracer is active
+ * we can safely replace the just-computed phase duties at the end of each FOC
+ * cycle. Dead time, complementary outputs, gate enable and VESC's measured
+ * over-current/fault machinery remain in place.
  *
  * The callback installed with mc_interface_set_pwm_callback() runs from the
  * motor-control interrupt after every PWM control cycle. Keep it short: no
@@ -22,14 +35,10 @@
 #define BH_FAST_TRIM_GAIN                 0.05f
 #define BH_FAST_TRIM_MIN                  0.50f
 #define BH_FAST_TRIM_MAX                  2.00f
-#define BH_FAST_MAX_DUTY                  0.12f
+#define BH_FAST_CURRENT_P_OHM             0.020f
+#define BH_FAST_MAX_LINE_MOD              0.12f
 #define BH_FAST_HARD_CLIPS_PER_SEC        10
-
-/* Open-loop duty mode controls q-axis voltage. Positive q at -120 degrees has
- * its alpha/beta vector at -30 degrees, exactly matching the A-B physical axis
- * used by the ordinary d-axis current tracer.
- */
-#define BH_FAST_DUTY_PHASE_DEG            (BH_FOC_PHASE_DEG - 90.0f)
+#define BH_FAST_OVERCURRENT_SAMPLES       4
 
 typedef struct {
 	volatile int count;
@@ -37,21 +46,27 @@ typedef struct {
 	volatile float b[BH_FAST_MAX_CYCLE_POINTS];
 	volatile float phase[BH_FAST_MAX_CYCLE_POINTS];
 	volatile float b_end;
-	volatile float peak_a;
+	volatile float amp_a;
+	volatile float center_a;
 	volatile float trim;
 	volatile unsigned hard_clips;
 } bh_fast_cycle_buf_t;
 
+/* bh_mini4_bh.h forward-declares these two so bh_live's wrapper can dispatch
+ * this optional mode before this include is expanded.
+ */
 static bool bh_fast_live_mode = false;
 static volatile bool bh_fast_active = false;
 static volatile bool bh_fast_external_stop = false;
 static volatile bool bh_fast_clip_abort = false;
 static volatile bool bh_fast_overcurrent_abort = false;
-static volatile bool bh_fast_duty_limited = false;
+static volatile bool bh_fast_mod_limited = false;
 
 static volatile float bh_fast_trim = 1.0f;
-static volatile float bh_fast_last_peak = 0.0f;
-static volatile float bh_fast_last_duty = 0.0f;
+static volatile float bh_fast_last_amp = 0.0f;
+static volatile float bh_fast_last_center = 0.0f;
+static volatile float bh_fast_last_mod = 0.0f;
+static volatile float bh_fast_last_vcmd = 0.0f;
 static volatile unsigned bh_fast_hard_clips = 0;
 
 static float bh_fast_fs = 30000.0f;
@@ -59,7 +74,6 @@ static float bh_fast_dt = 1.0f / 30000.0f;
 static float bh_fast_phase = 0.0f;
 static float bh_fast_phase_step = 0.0f;
 static float bh_fast_sense_zero = 1.65f;
-static float bh_fast_overmod = 1.0f;
 static int bh_fast_plot_div = 1;
 static int bh_fast_capture_stride = 1;
 static int bh_fast_cycle_n = 0;
@@ -71,9 +85,11 @@ static float bh_fast_last_vmed = 0.0f;
 static bool bh_fast_have_vmed = false;
 static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
 static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
+static float bh_fast_phist[3] = {0.0f, 0.0f, 0.0f};
 static int bh_fast_hist_n = 0;
 static float bh_fast_last_good_vs = 0.0f;
-static float bh_fast_cycle_peak = 0.0f;
+static float bh_fast_cycle_i_max = -1.0e30f;
+static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 static int bh_fast_clip_window_samples = 0;
 static int bh_fast_clip_window_events = 0;
@@ -103,27 +119,79 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	return b;
 }
 
-static inline float bh_fast_duty_for_phase(float p) {
+/* Direct MINI4 line modulation.
+ *
+ * Phase output 1 is TIM1 CH1 and phase output 2 is TIM1 CH2 on this
+ * HW_HAS_3_SHUNTS target. Centering the two compare values around 50% gives
+ *
+ *   Da = 0.5 + 0.5*m
+ *   Db = 0.5 - 0.5*m
+ *   average(Vab) = (Da - Db) * Vbus = m * Vbus.
+ *
+ * Phase 3 is unused by the fixture and is held low instead of being switched,
+ * which removes one unnecessary local PWM noise source. The complementary
+ * outputs and hardware dead time remain handled by TIM1/DRV8301 exactly as in
+ * normal VESC operation.
+ */
+static inline void bh_fast_write_line_mod(float line_mod) {
+	if (line_mod > BH_FAST_MAX_LINE_MOD) {
+		line_mod = BH_FAST_MAX_LINE_MOD;
+		bh_fast_mod_limited = true;
+	} else if (line_mod < -BH_FAST_MAX_LINE_MOD) {
+		line_mod = -BH_FAST_MAX_LINE_MOD;
+		bh_fast_mod_limited = true;
+	}
+
+	uint32_t top = TIM1->ARR;
+	float da = 0.5f + 0.5f * line_mod;
+	float db = 0.5f - 0.5f * line_mod;
+	uint32_t duty_a = (uint32_t)(da * (float)top + 0.5f);
+	uint32_t duty_b = (uint32_t)(db * (float)top + 0.5f);
+
+	if (duty_a > top) duty_a = top;
+	if (duty_b > top) duty_b = top;
+
+	TIM1->CR1 |= TIM_CR1_UDIS;
+	TIM1->CCR1 = duty_a;
+	TIM1->CCR2 = duty_b;
+	TIM1->CCR3 = 0U;
+	TIM1->CR1 &= ~TIM_CR1_UDIS;
+
+	bh_fast_last_mod = line_mod;
+}
+
+/* Immediate zero line voltage for a software abort. Both fixture legs are
+ * clamped low so winding current freewheels/decays through a zero-voltage
+ * state until the tracer thread executes the normal hard-off cleanup.
+ */
+static inline void bh_fast_write_zero_short(void) {
+	TIM1->CR1 |= TIM_CR1_UDIS;
+	TIM1->CCR1 = 0U;
+	TIM1->CCR2 = 0U;
+	TIM1->CCR3 = 0U;
+	TIM1->CR1 &= ~TIM_CR1_UDIS;
+	bh_fast_last_mod = 0.0f;
+}
+
+static inline void bh_fast_apply_model_voltage(float p, float i_now) {
 	float i_ref = bh_i_pk * bh_fast_triangle(p);
-	float didt = bh_i_pk * bh_freq * bh_fast_triangle_slope(p);
-	float v_line = bh_r_line_ohm * i_ref + bh_l_line_h * didt;
+	float didt_ref = bh_i_pk * bh_freq * bh_fast_triangle_slope(p);
+
+	/* R/L feed-forward does nearly all the work. The small proportional term is
+	 * intentionally much weaker than the winding resistance; it corrects model
+	 * error without turning this back into an aggressive current controller.
+	 */
+	float v_model = bh_r_line_ohm * i_ref + bh_l_line_h * didt_ref;
+	float v_cmd = bh_fast_trim * v_model +
+			BH_FAST_CURRENT_P_OHM * (i_ref - i_now);
+
 	float vbus = GET_INPUT_VOLTAGE();
 	if (vbus < 2.0f) {
 		vbus = 2.0f;
 	}
-	float den = vbus * bh_fast_overmod;
-	if (den < 1.0f) {
-		den = vbus;
-	}
-	float duty = bh_fast_trim * v_line / den;
-	if (duty > BH_FAST_MAX_DUTY) {
-		duty = BH_FAST_MAX_DUTY;
-		bh_fast_duty_limited = true;
-	} else if (duty < -BH_FAST_MAX_DUTY) {
-		duty = -BH_FAST_MAX_DUTY;
-		bh_fast_duty_limited = true;
-	}
-	return duty;
+
+	bh_fast_last_vcmd = v_cmd;
+	bh_fast_write_line_mod(v_cmd / vbus);
 }
 
 static inline void bh_fast_publish_cycle(void) {
@@ -132,14 +200,12 @@ static inline void bh_fast_publish_cycle(void) {
 		return;
 	}
 
-	/* Do not overwrite a buffer while the tracer thread is sending it. Dropping
-	 * an occasional display cycle is harmless; drive and integration continue.
-	 */
 	if (bh_fast_ready_idx < 0) {
 		bh_fast_cycle_buf_t *b = &bh_fast_buf[bh_fast_write_idx];
 		b->count = bh_fast_write_count;
 		b->b_end = bh_fast_b;
-		b->peak_a = bh_fast_cycle_peak;
+		b->amp_a = 0.5f * (bh_fast_cycle_i_max - bh_fast_cycle_i_min);
+		b->center_a = 0.5f * (bh_fast_cycle_i_max + bh_fast_cycle_i_min);
 		b->trim = bh_fast_trim;
 		b->hard_clips = bh_fast_hard_clips;
 		bh_fast_ready_idx = bh_fast_write_idx;
@@ -148,13 +214,18 @@ static inline void bh_fast_publish_cycle(void) {
 	bh_fast_write_count = 0;
 }
 
+static inline void bh_fast_abort_drive(void) {
+	bh_fast_write_zero_short();
+	bh_fast_active = false;
+}
+
 static void bh_fast_pwm_callback(void) {
 	if (!bh_fast_active) {
 		return;
 	}
 
-	/* An estop/release underneath us is an external request to stop. Never call
-	 * the open-loop setter after state leaves RUNNING or we would restart FOC.
+	/* VESC Tool's estop releases the motor underneath us. Do not write PWM after
+	 * that state transition; hardware is already being shut down by VESC.
 	 */
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
 		bh_fast_external_stop = true;
@@ -163,26 +234,25 @@ static void bh_fast_pwm_callback(void) {
 	}
 
 	if (bh_stop_requested || mc_interface_get_fault() != FAULT_CODE_NONE) {
-		mcpwm_foc_set_openloop_duty_phase(0.0f, BH_FAST_DUTY_PHASE_DEG);
+		bh_fast_abort_drive();
 		return;
 	}
 
 	float i_now = bh_coil_current();
-	float ai = fabsf(i_now);
-	if (ai > bh_fast_cycle_peak) {
-		bh_fast_cycle_peak = ai;
-	}
+	if (i_now > bh_fast_cycle_i_max) bh_fast_cycle_i_max = i_now;
+	if (i_now < bh_fast_cycle_i_min) bh_fast_cycle_i_min = i_now;
 
-	/* Independent software sanity limit. VESC's configured current limit remains
-	 * active as the primary protection, but a few consecutive samples well above
-	 * the requested fixture current terminate this diagnostic too.
+	/* Independent fast sanity limit. VESC's configured absolute-current fault is
+	 * still active as the primary hardware-aware protection. This check simply
+	 * removes our PWM command sooner if the experimental model is badly wrong.
 	 */
+	float ai = fabsf(i_now);
 	float oc_lim = fmaxf(bh_i_pk * 1.35f, bh_i_pk + 0.50f);
 	if (ai > oc_lim) {
 		bh_fast_overcurrent_count++;
-		if (bh_fast_overcurrent_count >= 4) {
+		if (bh_fast_overcurrent_count >= BH_FAST_OVERCURRENT_SAMPLES) {
 			bh_fast_overcurrent_abort = true;
-			mcpwm_foc_set_openloop_duty_phase(0.0f, BH_FAST_DUTY_PHASE_DEG);
+			bh_fast_abort_drive();
 			return;
 		}
 	} else {
@@ -198,7 +268,7 @@ static void bh_fast_pwm_callback(void) {
 	}
 	if (bh_fast_clip_window_events > BH_FAST_HARD_CLIPS_PER_SEC) {
 		bh_fast_clip_abort = true;
-		mcpwm_foc_set_openloop_duty_phase(0.0f, BH_FAST_DUTY_PHASE_DEG);
+		bh_fast_abort_drive();
 		return;
 	}
 	if (bh_fast_clip_window_samples >= (int)bh_fast_fs) {
@@ -212,9 +282,10 @@ static void bh_fast_pwm_callback(void) {
 		bh_fast_last_good_vs = vs;
 	}
 
-	/* A causal 3-sample median removes a single PWM/common-mode impulse without
-	 * imposing the long phase shift of a conventional low-pass. Pair it with the
-	 * middle current sample so H and dB/dt remain aligned to one PWM sample.
+	/* A causal 3-sample median removes isolated in-range PWM/common-mode spikes
+	 * without the long phase delay of a conventional low-pass. Pair B with the
+	 * middle current and phase sample so H, B and cycle-drift correction remain
+	 * time aligned.
 	 */
 	bh_fast_vhist[0] = bh_fast_vhist[1];
 	bh_fast_vhist[1] = bh_fast_vhist[2];
@@ -222,12 +293,16 @@ static void bh_fast_pwm_callback(void) {
 	bh_fast_ihist[0] = bh_fast_ihist[1];
 	bh_fast_ihist[1] = bh_fast_ihist[2];
 	bh_fast_ihist[2] = i_now;
+	bh_fast_phist[0] = bh_fast_phist[1];
+	bh_fast_phist[1] = bh_fast_phist[2];
+	bh_fast_phist[2] = bh_fast_phase;
 	if (bh_fast_hist_n < 3) {
 		bh_fast_hist_n++;
 	}
 
 	if (bh_fast_hist_n >= 3) {
-		float vmed = bh_fast_median3(bh_fast_vhist[0], bh_fast_vhist[1], bh_fast_vhist[2]);
+		float vmed = bh_fast_median3(
+				bh_fast_vhist[0], bh_fast_vhist[1], bh_fast_vhist[2]);
 		if (bh_fast_have_vmed) {
 			bh_fast_b += 0.5f * (bh_fast_last_vmed + vmed) * bh_fast_dt /
 					(BH_SENSE_TURNS * bh_area_m2);
@@ -242,40 +317,44 @@ static void bh_fast_pwm_callback(void) {
 			int n = bh_fast_write_count++;
 			b->h[n] = BH_EXC_TURNS * bh_fast_ihist[1] / bh_path_m;
 			b->b[n] = bh_fast_b;
-			b->phase[n] = bh_fast_phase;
+			b->phase[n] = bh_fast_phist[1];
 		}
 	}
 
 	bh_fast_sample_n++;
 	float next_phase = bh_fast_phase + bh_fast_phase_step;
 	if (next_phase >= 1.0f) {
-		/* Publish the just-completed cycle before zeroing its integral. The plot
-		 * thread removes the residual linear volt-second drift and recenters B.
-		 */
+		/* Publish the completed cycle before zeroing its relative B integral. */
 		bh_fast_publish_cycle();
 
-		bh_fast_last_peak = bh_fast_cycle_peak;
+		float amp = 0.5f * (bh_fast_cycle_i_max - bh_fast_cycle_i_min);
+		float center = 0.5f * (bh_fast_cycle_i_max + bh_fast_cycle_i_min);
+		bh_fast_last_amp = amp;
+		bh_fast_last_center = center;
+
 		if (bh_fast_cycle_n >= BH_FAST_WARMUP_CYCLES && bh_i_pk > 0.01f &&
-				bh_fast_cycle_peak > 0.02f) {
-			float err = (bh_i_pk - bh_fast_cycle_peak) / bh_i_pk;
+				amp > 0.02f) {
+			float err = (bh_i_pk - amp) / bh_i_pk;
 			utils_truncate_number(&err, -0.50f, 0.50f);
 			bh_fast_trim += BH_FAST_TRIM_GAIN * err;
-			utils_truncate_number((float*)&bh_fast_trim, BH_FAST_TRIM_MIN, BH_FAST_TRIM_MAX);
+			utils_truncate_number((float*)&bh_fast_trim,
+					BH_FAST_TRIM_MIN, BH_FAST_TRIM_MAX);
 		}
 
 		bh_fast_cycle_n++;
-		bh_fast_cycle_peak = 0.0f;
+		bh_fast_cycle_i_max = -1.0e30f;
+		bh_fast_cycle_i_min = 1.0e30f;
 		bh_fast_b = 0.0f;
 		bh_fast_sample_n = 0;
 		next_phase -= 1.0f;
 		bh_fast_capture_cycle = bh_fast_cycle_n >= BH_FAST_WARMUP_CYCLES &&
-				((bh_fast_cycle_n - BH_FAST_WARMUP_CYCLES) % bh_fast_capture_stride) == 0;
+				((bh_fast_cycle_n - BH_FAST_WARMUP_CYCLES) %
+						bh_fast_capture_stride) == 0;
 	}
 	bh_fast_phase = next_phase;
 
-	float duty = bh_fast_duty_for_phase(bh_fast_phase);
-	bh_fast_last_duty = duty;
-	mcpwm_foc_set_openloop_duty_phase(duty, BH_FAST_DUTY_PHASE_DEG);
+	/* Write the voltage for the next PWM cycle from the freshly updated phase. */
+	bh_fast_apply_model_voltage(bh_fast_phase, i_now);
 }
 
 static bool bh_fast_install_tight_current_limits(void) {
@@ -286,13 +365,17 @@ static bool bh_fast_install_tight_current_limits(void) {
 	}
 	*cfg = *mc_interface_get_configuration();
 
-	float axis_lim = bh_i_pk * BH_TWO_BY_SQRT3 * 1.50f;
-	if (axis_lim < 1.0f) {
-		axis_lim = 1.0f;
-	}
-	cfg->l_current_max = axis_lim;
-	cfg->l_current_min = -axis_lim;
-	cfg->l_abs_current_max = fmaxf(2.0f, axis_lim * 1.25f);
+	/* FOC's absolute-current protection sees the Clarke-vector magnitude, which
+	 * is 2/sqrt(3) times physical A-B line current for this fixture. Keep enough
+	 * margin for waveform error while still making a gross model mistake fault.
+	 */
+	float axis_req = bh_i_pk * BH_TWO_BY_SQRT3;
+	float axis_lim = fmaxf(1.0f, axis_req * 1.60f);
+	cfg->l_current_max = fmaxf(cfg->l_current_max, axis_lim);
+	cfg->l_current_min = fminf(cfg->l_current_min, -axis_lim);
+	cfg->l_abs_current_max = fminf(cfg->l_abs_current_max,
+			fmaxf(2.0f, axis_req * 1.90f));
+
 	mc_interface_set_configuration(cfg);
 	mempools_free_mcconf(cfg);
 	return true;
@@ -303,10 +386,12 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_external_stop = false;
 	bh_fast_clip_abort = false;
 	bh_fast_overcurrent_abort = false;
-	bh_fast_duty_limited = false;
+	bh_fast_mod_limited = false;
 	bh_fast_trim = 1.0f;
-	bh_fast_last_peak = 0.0f;
-	bh_fast_last_duty = 0.0f;
+	bh_fast_last_amp = 0.0f;
+	bh_fast_last_center = 0.0f;
+	bh_fast_last_mod = 0.0f;
+	bh_fast_last_vcmd = 0.0f;
 	bh_fast_hard_clips = 0;
 	bh_fast_phase = 0.0f;
 	bh_fast_sense_zero = sense_zero;
@@ -317,7 +402,8 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_have_vmed = false;
 	bh_fast_hist_n = 0;
 	bh_fast_last_good_vs = 0.0f;
-	bh_fast_cycle_peak = 0.0f;
+	bh_fast_cycle_i_max = -1.0e30f;
+	bh_fast_cycle_i_min = 1.0e30f;
 	bh_fast_overcurrent_count = 0;
 	bh_fast_clip_window_samples = 0;
 	bh_fast_clip_window_events = 0;
@@ -326,6 +412,7 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_write_count = 0;
 	memset((void*)bh_fast_vhist, 0, sizeof(bh_fast_vhist));
 	memset((void*)bh_fast_ihist, 0, sizeof(bh_fast_ihist));
+	memset((void*)bh_fast_phist, 0, sizeof(bh_fast_phist));
 
 	bh_fast_fs = mc_interface_get_sampling_frequency_now();
 	if (bh_fast_fs < 1000.0f) {
@@ -335,19 +422,14 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_phase_step = freq / bh_fast_fs;
 
 	float samples_per_cycle = bh_fast_fs / freq;
-	bh_fast_plot_div = (int)ceilf(samples_per_cycle / (float)BH_FAST_MAX_CYCLE_POINTS);
+	bh_fast_plot_div = (int)ceilf(samples_per_cycle /
+			(float)BH_FAST_MAX_CYCLE_POINTS);
 	if (bh_fast_plot_div < 1) {
 		bh_fast_plot_div = 1;
 	}
 	bh_fast_capture_stride = (int)ceilf(freq / BH_FAST_MAX_PLOT_LOOPS_HZ);
 	if (bh_fast_capture_stride < 1) {
 		bh_fast_capture_stride = 1;
-	}
-
-	const volatile mc_configuration *cfg = mc_interface_get_configuration();
-	bh_fast_overmod = cfg->foc_overmod_factor;
-	if (bh_fast_overmod < 0.1f) {
-		bh_fast_overmod = 1.0f;
 	}
 }
 
@@ -369,7 +451,7 @@ static void bh_fast_plot_ready_cycle(void) {
 
 	/* Search-coil integration only knows relative B. Remove the residual linear
 	 * volt-second error so each complete cycle closes, then center its extrema
-	 * around zero. This is done after acquisition so the ISR remains tiny.
+	 * around zero. This happens after acquisition so the ISR stays deterministic.
 	 */
 	float bmin = 1e30f;
 	float bmax = -1e30f;
@@ -414,14 +496,15 @@ static bool bh_fast_live_plot(float freq) {
 			(double)(bh_l_line_h * 1e6f), (double)bh_fast_fs,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	commands_printf("BH_FAST: PWM-rate V=R*I+L*dI/dt duty drive, slow peak trim, 3-sample median A1 integration; Experiment Plot History controls displayed loops.");
+	commands_printf("BH_FAST: direct centered phase1/phase2 PWM; Vab=R*I+L*dI/dt + weak P correction; slow cycle-amplitude trim; 3-sample median A1 integration.");
 
 	commands_init_plot("H (A/m)", "B relative (T)");
 	commands_plot_add_graph("B-H fast");
 	commands_plot_set_graph(0);
 
-	/* Clear any stale d-axis request before switching to q-axis duty mode. With
-	 * cc_min_current=0, this enters RUNNING even at zero current.
+	/* Enter the normal FOC RUNNING state solely to keep the gate/timer/fault
+	 * machinery alive. From the first callback onward our direct TIM1 compare
+	 * values, not the FOC current-controller duties, own the fixture bridge.
 	 */
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
@@ -430,11 +513,14 @@ static bool bh_fast_live_plot(float freq) {
 		return false;
 	}
 
-	float duty0 = bh_fast_duty_for_phase(0.0f);
-	mcpwm_foc_set_openloop_duty_phase(duty0, BH_FAST_DUTY_PHASE_DEG);
-	bh_fast_last_duty = duty0;
-	bh_fast_active = true;
+	/* Give FOC one scheduler tick to start its PWM state, then install our
+	 * callback. Zero model phase starts at Iref=0 on the positive-going ramp.
+	 */
+	chThdSleepMilliseconds(1);
+	bh_fast_write_line_mod(0.0f);
 	mc_interface_set_pwm_callback(bh_fast_pwm_callback);
+	bh_fast_active = true;
+	bh_fast_apply_model_voltage(0.0f, bh_coil_current());
 
 	uint32_t stat_t0 = timer_time_now();
 	while (!bh_stop_requested && bh_fast_active &&
@@ -452,17 +538,22 @@ static bool bh_fast_live_plot(float freq) {
 
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
-			commands_printf("BH_FAST_STAT Ipk_meas=%.5f A trim=%.5f duty=%.6f clips=%u%s",
-					(double)bh_fast_last_peak, (double)bh_fast_trim,
-					(double)bh_fast_last_duty, (unsigned)bh_fast_hard_clips,
-					bh_fast_duty_limited ? " DUTY_LIMIT" : "");
+			commands_printf("BH_FAST_STAT Iamp=%.5f A Icenter=%+.5f A trim=%.5f Vcmd=%+.6f V mod=%+.6f clips=%u%s",
+					(double)bh_fast_last_amp, (double)bh_fast_last_center,
+					(double)bh_fast_trim, (double)bh_fast_last_vcmd,
+					(double)bh_fast_last_mod, (unsigned)bh_fast_hard_clips,
+					bh_fast_mod_limited ? " MOD_LIMIT" : "");
 		}
 		chThdSleepMilliseconds(1);
 	}
 
 	bh_fast_active = false;
 	mc_interface_set_pwm_callback(0);
-	mcpwm_foc_set_openloop_duty_phase(0.0f, BH_FAST_DUTY_PHASE_DEG);
+
+	/* Do not pass through an active zero-current FOC state on exit. The normal
+	 * tracer hard-off helper immediately disables PWM while the worker still
+	 * owns the motor lock.
+	 */
 	bh_release_locked();
 
 	if (bh_fast_clip_abort) {
@@ -519,7 +610,7 @@ static void terminal_bh_live_fast(int argc, const char **argv) {
 static void bh_fast_init_commands(void) {
 	terminal_register_command_callback(
 			"bh_live_fast",
-			"PWM-rate model-feedforward B-H live plot with fast A1 integration.",
+			"PWM-rate direct-voltage B-H live plot with fast A1 integration.",
 			"<Ipk_A> <freq_Hz> <path_mm> <area_mm2>",
 			terminal_bh_live_fast);
 }
