@@ -152,10 +152,31 @@ static inline void bh_fast_send_plot_point(float x, float y) {
     }
 }
 
+/* terminal_v2 normally owns the single mc_interface PWM callback so Sampled
+ * Data phase 3 can display INA282 OUT. bh_live_fast also needs that callback
+ * for its 30 kHz generator. Multiplex the two during fast mode, then restore
+ * the scope callback on exit instead of leaving the callback slot empty.
+ */
+static void bh_fast_pwm_callback(void);
+static void bh_sample_scope_pwm_cb(void);
+static void bh_fast_pwm_callback_mux(void) {
+    bh_fast_pwm_callback();
+    bh_sample_scope_pwm_cb();
+}
+static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
+    if (p_func) {
+        mc_interface_set_pwm_callback(bh_fast_pwm_callback_mux);
+    } else {
+        mc_interface_set_pwm_callback(bh_sample_scope_pwm_cb);
+    }
+}
+
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define bh_coil_current() bh_fast_coil_current_median()
 #define commands_send_plot_points(x, y) bh_fast_send_plot_point((x), (y))
+#define mc_interface_set_pwm_callback(p_func) bh_fast_set_pwm_callback_mux(p_func)
 #include "hw_mini4_bh_fast.inc"
+#undef mc_interface_set_pwm_callback
 #undef commands_send_plot_points
 #undef bh_coil_current
 #undef bh_apply_current
