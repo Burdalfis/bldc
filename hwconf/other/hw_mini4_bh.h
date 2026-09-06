@@ -55,6 +55,14 @@ static inline void bh_rtos_sleep(float seconds) {
 
 #undef timer_sleep
 
+/* The legacy terminal file contains a renamed, unused worker body that still
+ * references the final bh_run_one()/bh_print_metrics() names. Declare those
+ * wrappers before compiling that body so GCC does not create implicit int
+ * declarations and later reject the real static definitions in bh_live.inc.
+ */
+static bool bh_run_one(float freq, bool sine_wave, bool print_raw, bh_metrics_t *m);
+static void bh_print_metrics(float freq, const bh_metrics_t *m, bool sweep);
+
 /* Keep the legacy command callbacks, but rename its worker. The queue helper
  * in capture.inc was compiled earlier against the original bh_thread forward
  * declaration, so it will dispatch to the fixed worker defined below.
