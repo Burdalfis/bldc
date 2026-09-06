@@ -3,30 +3,21 @@
  * This path deliberately does not replace the existing current-controlled
  * bh_live implementation. It is an experimental A/B path that:
  *   - generates the requested triangle at the FOC/PWM callback rate,
- *   - drives the phase-1/phase-2 fixture winding directly from
+ *   - drives the phase-1/phase-2 fixture winding from
  *         Vab = Rline * Iref + Lline * dIref/dt
  *     plus a deliberately weak proportional current-error correction,
- *   - applies that voltage as centered differential PWM directly to TIM1
- *     rather than routing it back through VESC's duty/current controller,
+ *   - injects the resulting fixed-axis alpha/beta vector immediately before
+ *     VESC's normal foc_svm() stage, bypassing current/duty regulation while
+ *     retaining VESC's sector selection, PWM timing, deadtime and ADC sampling,
  *   - slowly trims the model voltage from measured cycle current amplitude,
  *   - samples phase current and A1 at the PWM callback rate,
  *   - median-rejects isolated one-sample A1 impulses before B integration,
  *   - closes and centers each plotted B loop cycle-wise in the thread.
  *
- * Why direct TIM1 compare updates?
- * -------------------------------
- * CONTROL_MODE_OPENLOOP_DUTY_PHASE is not a raw voltage output in VESC FOC.
- * It still uses the duty/current-control machinery to reach the requested
- * modulation. That is exactly the extra closed-loop behavior this diagnostic
- * is trying to remove. MINI4 has three phase shunts and a conventional TIM1
- * complementary PWM bridge, so while this hardware-specific tracer is active
- * we can safely replace the just-computed phase duties at the end of each FOC
- * cycle. Dead time, complementary outputs, gate enable and VESC's measured
- * over-current/fault machinery remain in place.
- *
- * The callback installed with mc_interface_set_pwm_callback() runs from the
- * motor-control interrupt after every PWM control cycle. Keep it short: no
- * printf, allocation, terminal packets or sleeps are permitted there.
+ * The callback installed with mc_interface_set_pwm_callback() runs after each
+ * motor-control cycle. It computes the command that the next FOC cycle will
+ * consume through the MINI4-only foc_svm wrapper in foc_math.h. No timer compare
+ * registers are touched here; the FOC driver remains the sole owner of the FETs.
  */
 
 #define BH_FAST_MAX_CYCLE_POINTS          400
@@ -36,9 +27,16 @@
 #define BH_FAST_TRIM_MIN                  0.50f
 #define BH_FAST_TRIM_MAX                  2.00f
 #define BH_FAST_CURRENT_P_OHM             0.020f
-#define BH_FAST_MAX_LINE_MOD              0.12f
+#define BH_FAST_MAX_LINE_RATIO            0.12f
 #define BH_FAST_HARD_CLIPS_PER_SEC        10
 #define BH_FAST_OVERCURRENT_SAMPLES       4
+
+/* These have external linkage because motor/foc_math.h references them from
+ * the separately compiled mcpwm_foc.c translation unit on this target only.
+ */
+volatile bool bh_foc_svm_override_active = false;
+volatile float bh_foc_svm_override_alpha = 0.0f;
+volatile float bh_foc_svm_override_beta = 0.0f;
 
 typedef struct {
 	volatile int count;
@@ -119,57 +117,43 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	return b;
 }
 
-/* Direct MINI4 line modulation.
+/* Convert desired A-B line-voltage ratio to the alpha/beta modulation that
+ * VESC's foc_svm() expects.
  *
- * Phase output 1 is TIM1 CH1 and phase output 2 is TIM1 CH2 on this
- * HW_HAS_3_SHUNTS target. Centering the two compare values around 50% gives
+ * For this fixed A-B winding the electrical vector is at -30 degrees and
+ * Vab = sqrt(3) * Vd. Therefore
+ *     v_alpha = +Vab/2
+ *     v_beta  = -Vab/(2*sqrt(3))
+ * and VESC normalizes alpha/beta by 2/3*Vbus, giving
+ *     mod_alpha = +0.75 * Vab/Vbus
+ *     mod_beta  = -sqrt(3)/4 * Vab/Vbus.
  *
- *   Da = 0.5 + 0.5*m
- *   Db = 0.5 - 0.5*m
- *   average(Vab) = (Da - Db) * Vbus = m * Vbus.
- *
- * Phase 3 is unused by the fixture and is held low instead of being switched,
- * which removes one unnecessary local PWM noise source. The complementary
- * outputs and hardware dead time remain handled by TIM1/DRV8301 exactly as in
- * normal VESC operation.
+ * The override is consumed inside foc_svm(), so VESC still calculates the
+ * actual SVM sector and timer duties and keeps its ADC/current reconstruction
+ * synchronized with the waveform that really reaches the bridge.
  */
-static inline void bh_fast_write_line_mod(float line_mod) {
-	if (line_mod > BH_FAST_MAX_LINE_MOD) {
-		line_mod = BH_FAST_MAX_LINE_MOD;
+static inline void bh_fast_set_line_ratio(float line_ratio) {
+	if (line_ratio > BH_FAST_MAX_LINE_RATIO) {
+		line_ratio = BH_FAST_MAX_LINE_RATIO;
 		bh_fast_mod_limited = true;
-	} else if (line_mod < -BH_FAST_MAX_LINE_MOD) {
-		line_mod = -BH_FAST_MAX_LINE_MOD;
+	} else if (line_ratio < -BH_FAST_MAX_LINE_RATIO) {
+		line_ratio = -BH_FAST_MAX_LINE_RATIO;
 		bh_fast_mod_limited = true;
 	}
 
-	uint32_t top = TIM1->ARR;
-	float da = 0.5f + 0.5f * line_mod;
-	float db = 0.5f - 0.5f * line_mod;
-	uint32_t duty_a = (uint32_t)(da * (float)top + 0.5f);
-	uint32_t duty_b = (uint32_t)(db * (float)top + 0.5f);
-
-	if (duty_a > top) duty_a = top;
-	if (duty_b > top) duty_b = top;
-
-	TIM1->CR1 |= TIM_CR1_UDIS;
-	TIM1->CCR1 = duty_a;
-	TIM1->CCR2 = duty_b;
-	TIM1->CCR3 = 0U;
-	TIM1->CR1 &= ~TIM_CR1_UDIS;
-
-	bh_fast_last_mod = line_mod;
+	bh_foc_svm_override_alpha = 0.75f * line_ratio;
+	bh_foc_svm_override_beta = -0.43301270189f * line_ratio;
+	bh_foc_svm_override_active = true;
+	bh_fast_last_mod = line_ratio;
 }
 
-/* Immediate zero line voltage for a software abort. Both fixture legs are
- * clamped low so winding current freewheels/decays through a zero-voltage
- * state until the tracer thread executes the normal hard-off cleanup.
- */
-static inline void bh_fast_write_zero_short(void) {
-	TIM1->CR1 |= TIM_CR1_UDIS;
-	TIM1->CCR1 = 0U;
-	TIM1->CCR2 = 0U;
-	TIM1->CCR3 = 0U;
-	TIM1->CR1 &= ~TIM_CR1_UDIS;
+static inline void bh_fast_disable_svm_override(void) {
+	/* Drop active first so a concurrent FOC cycle cannot consume half-updated
+	 * zero values. On MINI4 all 32-bit stores are naturally atomic.
+	 */
+	bh_foc_svm_override_active = false;
+	bh_foc_svm_override_alpha = 0.0f;
+	bh_foc_svm_override_beta = 0.0f;
 	bh_fast_last_mod = 0.0f;
 }
 
@@ -191,7 +175,7 @@ static inline void bh_fast_apply_model_voltage(float p, float i_now) {
 	}
 
 	bh_fast_last_vcmd = v_cmd;
-	bh_fast_write_line_mod(v_cmd / vbus);
+	bh_fast_set_line_ratio(v_cmd / vbus);
 }
 
 static inline void bh_fast_publish_cycle(void) {
@@ -215,7 +199,11 @@ static inline void bh_fast_publish_cycle(void) {
 }
 
 static inline void bh_fast_abort_drive(void) {
-	bh_fast_write_zero_short();
+	/* Keep the SVM override active at a zero vector until the tracer thread can
+	 * execute the normal hard-off path. Do not hand control back to the current
+	 * PI while winding current is still present.
+	 */
+	bh_fast_set_line_ratio(0.0f);
 	bh_fast_active = false;
 }
 
@@ -224,8 +212,8 @@ static void bh_fast_pwm_callback(void) {
 		return;
 	}
 
-	/* VESC Tool's estop releases the motor underneath us. Do not write PWM after
-	 * that state transition; hardware is already being shut down by VESC.
+	/* VESC Tool's estop releases the motor underneath us. Do not command a new
+	 * vector after that state transition; hardware is already being shut down.
 	 */
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
 		bh_fast_external_stop = true;
@@ -242,9 +230,9 @@ static void bh_fast_pwm_callback(void) {
 	if (i_now > bh_fast_cycle_i_max) bh_fast_cycle_i_max = i_now;
 	if (i_now < bh_fast_cycle_i_min) bh_fast_cycle_i_min = i_now;
 
-	/* Independent fast sanity limit. VESC's configured absolute-current fault is
-	 * still active as the primary hardware-aware protection. This check simply
-	 * removes our PWM command sooner if the experimental model is badly wrong.
+	/* Independent fast sanity limit. VESC's configured absolute-current fault
+	 * remains intact, while this much tighter fixture-specific limit removes the
+	 * commanded vector after four consecutive excessive current samples.
 	 */
 	float ai = fabsf(i_now);
 	float oc_lim = fmaxf(bh_i_pk * 1.35f, bh_i_pk + 0.50f);
@@ -353,7 +341,7 @@ static void bh_fast_pwm_callback(void) {
 	}
 	bh_fast_phase = next_phase;
 
-	/* Write the voltage for the next PWM cycle from the freshly updated phase. */
+	/* Command the vector for the next FOC/SVM cycle. */
 	bh_fast_apply_model_voltage(bh_fast_phase, i_now);
 }
 
@@ -365,16 +353,16 @@ static bool bh_fast_install_tight_current_limits(void) {
 	}
 	*cfg = *mc_interface_get_configuration();
 
-	/* FOC's absolute-current protection sees the Clarke-vector magnitude, which
-	 * is 2/sqrt(3) times physical A-B line current for this fixture. Keep enough
-	 * margin for waveform error while still making a gross model mistake fault.
+	/* Ensure ordinary FOC current-limit bookkeeping will not reject the fixture
+	 * current. Do not artificially lower l_abs_current_max here: the fast
+	 * fixture-specific four-sample guard above is much tighter, while retaining
+	 * the user's normal hardware absolute-current protection avoids false faults
+	 * from normal PWM ripple/current-sense transients.
 	 */
 	float axis_req = bh_i_pk * BH_TWO_BY_SQRT3;
 	float axis_lim = fmaxf(1.0f, axis_req * 1.60f);
 	cfg->l_current_max = fmaxf(cfg->l_current_max, axis_lim);
 	cfg->l_current_min = fminf(cfg->l_current_min, -axis_lim);
-	cfg->l_abs_current_max = fminf(cfg->l_abs_current_max,
-			fmaxf(2.0f, axis_req * 1.90f));
 
 	mc_interface_set_configuration(cfg);
 	mempools_free_mcconf(cfg);
@@ -382,6 +370,7 @@ static bool bh_fast_install_tight_current_limits(void) {
 }
 
 static void bh_fast_reset_state(float freq, float sense_zero) {
+	bh_fast_disable_svm_override();
 	bh_fast_active = false;
 	bh_fast_external_stop = false;
 	bh_fast_clip_abort = false;
@@ -476,7 +465,7 @@ static void bh_fast_plot_ready_cycle(void) {
 
 static bool bh_fast_live_plot(float freq) {
 	if (!bh_rl_valid || bh_r_line_ohm <= 0.0f || bh_l_line_h <= 0.0f) {
-		commands_printf("BH_FAST_ABORT R/L model is not valid; run bh_measure_rl after flashing first.");
+		commands_printf("BH_FAST_ABORT R/L model invalid; run bh_measure_rl first.");
 		return false;
 	}
 
@@ -491,20 +480,20 @@ static bool bh_fast_live_plot(float freq) {
 	}
 	bh_fast_reset_state(freq, sense_zero);
 
-	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz Rline=%.6f mOhm Lline=%.6f uH fs=%.1f Hz turns=%g/%g zero=%.7f V sense=%+d",
+	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz R=%.6f mOhm L=%.6f uH fs=%.1f Hz turns=%g/%g zero=%.7f V sense=%+d",
 			(double)bh_i_pk, (double)freq, (double)(bh_r_line_ohm * 1e3f),
 			(double)(bh_l_line_h * 1e6f), (double)bh_fast_fs,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	commands_printf("BH_FAST: direct centered phase1/phase2 PWM; Vab=R*I+L*dI/dt + weak P correction; slow cycle-amplitude trim; 3-sample median A1 integration.");
+	commands_printf("BH_FAST: raw fixed-axis modulation through normal FOC SVM; model feed-forward + weak P + slow amplitude trim.");
 
 	commands_init_plot("H (A/m)", "B relative (T)");
 	commands_plot_add_graph("B-H fast");
 	commands_plot_set_graph(0);
 
-	/* Enter the normal FOC RUNNING state solely to keep the gate/timer/fault
-	 * machinery alive. From the first callback onward our direct TIM1 compare
-	 * values, not the FOC current-controller duties, own the fixture bridge.
+	/* Enter RUNNING with a harmless zero-current fixed phase. The FOC controller
+	 * keeps all normal timer/gate/current-sampling/fault machinery alive, while
+	 * the SVM wrapper below replaces only its final alpha/beta command.
 	 */
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
@@ -513,11 +502,9 @@ static bool bh_fast_live_plot(float freq) {
 		return false;
 	}
 
-	/* Give FOC one scheduler tick to start its PWM state, then install our
-	 * callback. Zero model phase starts at Iref=0 on the positive-going ramp.
+	/* Install the high-rate generator and immediately provide its first vector.
+	 * There is no direct TIM1 manipulation and no 1 ms active-zero dwell.
 	 */
-	chThdSleepMilliseconds(1);
-	bh_fast_write_line_mod(0.0f);
 	mc_interface_set_pwm_callback(bh_fast_pwm_callback);
 	bh_fast_active = true;
 	bh_fast_apply_model_voltage(0.0f, bh_coil_current());
@@ -538,7 +525,7 @@ static bool bh_fast_live_plot(float freq) {
 
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
-			commands_printf("BH_FAST_STAT Iamp=%.5f A Icenter=%+.5f A trim=%.5f Vcmd=%+.6f V mod=%+.6f clips=%u%s",
+			commands_printf("BH_FAST_STAT Iamp=%.5f A Icenter=%+.5f A trim=%.5f Vcmd=%+.6f V Vab/Vbus=%+.6f clips=%u%s",
 					(double)bh_fast_last_amp, (double)bh_fast_last_center,
 					(double)bh_fast_trim, (double)bh_fast_last_vcmd,
 					(double)bh_fast_last_mod, (unsigned)bh_fast_hard_clips,
@@ -550,11 +537,13 @@ static bool bh_fast_live_plot(float freq) {
 	bh_fast_active = false;
 	mc_interface_set_pwm_callback(0);
 
-	/* Do not pass through an active zero-current FOC state on exit. The normal
-	 * tracer hard-off helper immediately disables PWM while the worker still
-	 * owns the motor lock.
+	/* Hold a zero SVM vector until PWM is physically disabled, then remove the
+	 * override. This prevents the dormant current PI from taking control during
+	 * the shutdown transition.
 	 */
+	bh_fast_set_line_ratio(0.0f);
 	bh_release_locked();
+	bh_fast_disable_svm_override();
 
 	if (bh_fast_clip_abort) {
 		commands_printf("BH_FAST_DONE ABORT sustained A1 clipping (>10 hard-rail samples/s)");
@@ -610,7 +599,7 @@ static void terminal_bh_live_fast(int argc, const char **argv) {
 static void bh_fast_init_commands(void) {
 	terminal_register_command_callback(
 			"bh_live_fast",
-			"PWM-rate direct-voltage B-H live plot with fast A1 integration.",
+			"PWM-rate model-voltage B-H live plot through normal FOC SVM.",
 			"<Ipk_A> <freq_Hz> <path_mm> <area_mm2>",
 			terminal_bh_live_fast);
 }
