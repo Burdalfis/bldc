@@ -37,6 +37,20 @@ static void bh_keep_programmed_run_gains(mc_configuration *cfg) {
 	(void)cfg;
 }
 
+/* VESC normally has an efficiency optimization that turns an exact zero SVM
+ * vector into a static all-low-side short. On this fixture that creates a very
+ * abrupt bridge common-mode/topology transition whenever the controller passes
+ * through zero modulation, which can capacitively kick the search winding and
+ * INA282. During a tracer waveform keep ordinary complementary PWM alive all
+ * the way through zero volts. Intentional zero/offset measurements still use
+ * bh_release_hard_off() below and therefore remain genuinely undriven.
+ */
+static void bh_common_cfg_tracer(mc_configuration *cfg, float max_line_current) {
+	bh_common_cfg(cfg, max_line_current);
+	cfg->foc_short_ls_on_zero_duty = false;
+}
+#define bh_common_cfg bh_common_cfg_tracer
+
 /* The generic FOC "release motor" path does not mean "state OFF right now".
  * It asks the FOC controller to release, which can leave MC_STATE_RUNNING set
  * while the release state is being processed. That is fine for a normal ESC,
