@@ -88,19 +88,9 @@ static bool bh_fast_live_plot(float freq);
 #include "hw_mini4_bh_live.inc"
 #undef timer_sleep
 
-/* bh_live_fast owns the actual bridge voltage below VESC's current controller,
- * but FOC's housekeeping still looks at its ordinary current target when
- * deciding whether the motor should remain MC_STATE_RUNNING. A literal 0-A
- * target can therefore make FOC auto-release even while the raw SVM override
- * is producing the requested fixture voltage; bh_live_fast then mistakes that
- * state exit for VESC Tool Stop.
- *
- * Give only the fast-mode startup call a harmless 10 mA line-current keeper.
- * The SVM override still completely determines the bridge waveform, while the
- * dormant current loop now has a nonzero target that prevents idle auto-off.
- * A real Stop/release command overwrites that target, so external Stop remains
- * detectable. If the SVM override ever failed to engage, the fallback command
- * is only 10 mA and is therefore intrinsically gentle.
+/* Give the fast-mode startup call a harmless nonzero target so FOC is already
+ * in MC_STATE_RUNNING before its PWM callback takes over the reference. The
+ * callback immediately replaces this with the real triangle-current target.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
@@ -110,9 +100,8 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
 }
 
 /* Fast mode sees raw phase-current samples at PWM cadence. Isolated switching
- * spikes were large enough to fool the cycle peak tracker even when the useful
- * triangle was well behaved. A causal 3-sample median removes one-sample
- * outliers without materially changing a 10..200 Hz waveform at 15 kHz.
+ * spikes are large enough to distort both H and peak measurements. A causal
+ * 3-sample median removes one-sample outliers with only one FOC-sample delay.
  */
 static inline float bh_fast_coil_current_median(void) {
     static float h0 = 0.0f;
@@ -136,34 +125,30 @@ static inline float bh_fast_coil_current_median(void) {
     return b;
 }
 
-/* Experiment Plot packets are comparatively expensive. Fast acquisition can
- * buffer hundreds of display points per selected cycle. Keep one eighth of
- * those already-decimated points and yield 1 ms after each transmitted point.
- * This is display-only decimation: the waveform generator and B integration
- * are unaffected. At 10 Hz this is about 45..50 points per plotted loop and
- * roughly 250 plot packets/s, leaving generous service time for Sampled Data
- * and USB housekeeping.
+/* VESC Tool's HFI plot path demonstrates that the USB/plot protocol can carry
+ * thousands of points per second. Keep every second already-decimated point
+ * and do not sleep per packet. Yield only occasionally so other ready threads
+ * still get prompt service. At the 20 plotted-loop/s cap this is typically
+ * around 2..4 kplot-points/s depending on excitation frequency.
  */
 static unsigned bh_fast_plot_tx_decim = 0U;
+static unsigned bh_fast_plot_tx_yield = 0U;
 static inline void bh_fast_send_plot_point(float x, float y) {
-    if ((bh_fast_plot_tx_decim++ & 7U) == 0U) {
+    if ((bh_fast_plot_tx_decim++ & 1U) == 0U) {
         commands_send_plot_points(x, y);
-        chThdSleepMilliseconds(1);
+        if ((++bh_fast_plot_tx_yield & 31U) == 0U) {
+            chThdYield();
+        }
     }
 }
 
-/* Keep the VESC FOC/SVM/ADC engine itself at 30 kHz, but run the extra B-H
- * generator/acquisition callback every second FOC cycle. The last raw SVM
- * command is simply held for the intervening cycle. This cuts the substantial
- * tracer ISR workload roughly in half while retaining 15 kHz command updates:
- * 1500 points/cycle at 10 Hz and 75 points/cycle even at 200 Hz.
- *
- * The fast implementation derives phase step and integration dt from
- * mc_interface_get_sampling_frequency_now(), so present the effective 15 kHz
- * tracer rate to that include while leaving the real FOC frequency untouched.
+/* Run the extra B-H generator/acquisition callback at the full FOC callback
+ * cadence. The previous voltage-drive prototype used every second callback to
+ * save ISR time; the current-reference generator is much lighter and benefits
+ * directly from updating its target on every control cycle.
  */
 static inline float bh_fast_effective_sample_hz(void) {
-    return 0.5f * mc_interface_get_sampling_frequency_now();
+    return mc_interface_get_sampling_frequency_now();
 }
 
 /* terminal_v2 normally owns the single mc_interface PWM callback so Sampled
@@ -200,16 +185,11 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
 #undef bh_coil_current
 #undef bh_apply_current
 
-/* Called at the real PWM callback rate. Only every other invocation executes
- * the heavier tracer core; the FOC SVM keeps using the previous override on
- * the skipped cycle. Keep the scope overlay at the full FOC rate in the mux.
+/* Full-rate wrapper kept separate so the mux can continue presenting the INA
+ * scope overlay at the same cadence as the current-reference generator.
  */
 static void bh_fast_pwm_callback(void) {
-    static bool do_core = false;
-    do_core = !do_core;
-    if (do_core) {
-        bh_fast_pwm_callback_core();
-    }
+    bh_fast_pwm_callback_core();
 }
 
 #include "hw_mini4_bh_worker_v2.inc"
