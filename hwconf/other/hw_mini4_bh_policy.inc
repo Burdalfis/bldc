@@ -11,6 +11,15 @@
  */
 static int bh_sense_polarity = 1;
 
+/* Current fixture revision: the original 20-turn excitation and 10-turn sense
+ * windings were both unwound by half. Keep the old core include generic, but
+ * override the geometry before any measurement/capture include is expanded.
+ */
+#undef BH_EXC_TURNS
+#undef BH_SENSE_TURNS
+#define BH_EXC_TURNS 10.0f
+#define BH_SENSE_TURNS 5.0f
+
 static bool bh_l_sweep_mode = false;
 static bool bh_l_sweep_suppress_metric = false;
 static float bh_l_i_min = 0.05f;
