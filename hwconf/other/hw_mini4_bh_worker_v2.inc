@@ -51,27 +51,29 @@ static THD_FUNCTION(bh_thread, arg) {
 		*cfg = *cfg_old;
 
 		/* Critical ordering: block all ordinary control commands before the
-		 * cc_min_current=0 tracer config can become active. Also force the bridge
-		 * into the true FOC-off state both before and after reconfiguration.
+		 * cc_min_current=0 tracer config can become active. The normal VESC motor
+		 * timeout itself can call mc_interface_unlock() and command 0-A braking,
+		 * so start feeding it before taking ownership and keep feeding it during
+		 * every intentional bridge-off dwell.
 		 */
-		mc_interface_lock();
-		mcpwm_foc_stop_pwm(false);
+		timeout_reset();
+		bh_release_locked();
 
 		bool ok = true;
 		if (job == BH_JOB_MEASURE_RL) {
 			bh_common_cfg(cfg, bh_rl_current);
 			bh_set_measurement_gains(cfg, 0.020f);
 			mc_interface_set_configuration(cfg);
-			mcpwm_foc_stop_pwm(false);
-			chThdSleepMilliseconds(100);
+			bh_release_locked();
+			bh_hold_hard_off_ms(100);
 			commands_printf("BH_SETUP locked/off; tracer config settled");
 			ok = bh_measure_rl_locked(cfg, bh_rl_current, bh_rl_freq);
 		} else {
 			bh_common_cfg(cfg, bh_i_pk);
 			bh_set_run_gains(cfg);
 			mc_interface_set_configuration(cfg);
-			mcpwm_foc_stop_pwm(false);
-			chThdSleepMilliseconds(100);
+			bh_release_locked();
+			bh_hold_hard_off_ms(100);
 			commands_printf("BH_SETUP locked/off; tracer config settled");
 			commands_printf("BH_CTRL Rline=%.6f mOhm Lline=%.6f uH Kp=%.7g Ki=%.7g BW=%.1f Hz",
 					(double)(bh_r_line_ohm * 1e3f), (double)(bh_l_line_h * 1e6f),
@@ -112,10 +114,9 @@ static THD_FUNCTION(bh_thread, arg) {
 		 * cc_min_current=0 tracer config to ordinary app/CAN/USB commands.
 		 */
 		bh_release_locked();
-		mcpwm_foc_stop_pwm(false);
-		chThdSleepMilliseconds(5);
+		bh_hold_hard_off_ms(5);
 		mc_interface_set_configuration(cfg_old);
-		mcpwm_foc_stop_pwm(false);
+		bh_release_locked();
 		mc_interface_unlock();
 
 		mempools_free_mcconf(cfg);
