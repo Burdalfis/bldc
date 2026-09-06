@@ -7,9 +7,11 @@
  *
  * Search-winding polarity is explicit and RAM-only. +1 means increasing
  * positive excitation flux should produce positive corrected Vsense in the
- * tracer convention; -1 flips the sense winding in software.
+ * tracer convention; -1 flips the sense winding in software. The present
+ * physical fixture has been verified to require -1, so make that the power-on
+ * default while retaining bh_sense_pol for experiments or rewiring.
  */
-static int bh_sense_polarity = 1;
+static int bh_sense_polarity = -1;
 
 /* Current fixture revision: the original 20-turn excitation and 10-turn sense
  * windings were both unwound by half. Keep the old core include generic, but
