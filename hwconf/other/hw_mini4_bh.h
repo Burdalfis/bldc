@@ -125,19 +125,28 @@ static inline float bh_fast_coil_current_median(void) {
     return b;
 }
 
-/* VESC Tool's HFI plot path demonstrates that the USB/plot protocol can carry
- * thousands of points per second. Keep every second already-decimated point
- * and do not sleep per packet. Yield only occasionally so other ready threads
- * still get prompt service. At the 20 plotted-loop/s cap this is typically
- * around 2..4 kplot-points/s depending on excitation frequency.
+/* HFI plotting does not use a hidden bulk-packet transport. COMM_PLOT_DATA is
+ * one x/y point per packet. The important difference is pacing: the HFI thread
+ * wakes every 500 us, but only emits a plot burst every eighth pass (~4 ms).
+ * Its DFT mode sends five graph points in that burst, i.e. about 1250 plot
+ * packets/s, and then gets out of the way so USB and SampleSender can run.
+ *
+ * Our cycle-buffered B-H plot used to dump hundreds of packets back-to-back.
+ * That can keep the USB stream permanently backlogged even when the average
+ * byte rate is reasonable. Keep every second display point, send five-point
+ * bursts, then sleep 4 ms. Acquisition/current generation continue in the PWM
+ * callback while this worker sleeps; completed plot cycles can simply be
+ * dropped when the display cannot keep up.
  */
 static unsigned bh_fast_plot_tx_decim = 0U;
-static unsigned bh_fast_plot_tx_yield = 0U;
+static unsigned bh_fast_plot_tx_burst = 0U;
 static inline void bh_fast_send_plot_point(float x, float y) {
     if ((bh_fast_plot_tx_decim++ & 1U) == 0U) {
         commands_send_plot_points(x, y);
-        if ((++bh_fast_plot_tx_yield & 31U) == 0U) {
-            chThdYield();
+        bh_fast_plot_tx_burst++;
+        if (bh_fast_plot_tx_burst >= 5U) {
+            bh_fast_plot_tx_burst = 0U;
+            chThdSleepMilliseconds(4);
         }
     }
 }
