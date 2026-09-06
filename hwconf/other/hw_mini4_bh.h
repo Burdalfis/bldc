@@ -52,7 +52,17 @@ static inline void bh_rtos_sleep(float seconds) {
 #include "hw_mini4_bh_terminal.inc"
 #undef bh_init_commands
 #include "hw_mini4_bh_zero_diag.inc"
+
+/* Keep terminal_v2 intact: rename its initializer, then wrap it so the new
+ * static bridge-state diagnostics are registered as well.
+ */
+#define bh_init_commands bh_init_commands_v2_base
 #include "hw_mini4_bh_terminal_v2.inc"
+#undef bh_init_commands
+static void bh_init_commands(void) {
+    bh_init_commands_v2_base();
+    bh_zero_diag_init_commands();
+}
 
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
