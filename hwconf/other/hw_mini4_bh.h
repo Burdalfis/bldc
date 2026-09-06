@@ -87,7 +87,31 @@ static bool bh_fast_live_plot(float freq);
 #define timer_sleep(seconds) bh_rtos_sleep(seconds)
 #include "hw_mini4_bh_live.inc"
 #undef timer_sleep
+
+/* bh_live_fast owns the actual bridge voltage below VESC's current controller,
+ * but FOC's housekeeping still looks at its ordinary current target when
+ * deciding whether the motor should remain MC_STATE_RUNNING. A literal 0-A
+ * target can therefore make FOC auto-release even while the raw SVM override
+ * is producing the requested fixture voltage; bh_live_fast then mistakes that
+ * state exit for VESC Tool Stop.
+ *
+ * Give only the fast-mode startup call a harmless 10 mA line-current keeper.
+ * The SVM override still completely determines the bridge waveform, while the
+ * dormant current loop now has a nonzero target that prevents idle auto-off.
+ * A real Stop/release command overwrites that target, so external Stop remains
+ * detectable. If the SVM override ever failed to engage, the fallback command
+ * is only 10 mA and is therefore intrinsically gentle.
+ */
+static inline void bh_fast_apply_keeper_current(float i_line) {
+    if (fabsf(i_line) < 0.001f) {
+        i_line = 0.010f;
+    }
+    bh_apply_current(i_line);
+}
+#define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #include "hw_mini4_bh_fast.inc"
+#undef bh_apply_current
+
 #include "hw_mini4_bh_worker_v2.inc"
 
 /* Keep terminal_v2 intact: rename its initializer, then wrap it so the live
