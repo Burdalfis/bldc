@@ -20,15 +20,7 @@ typedef struct {
 } bh_lpoint_t;
 
 static float bh_measure_sense_zero_quick(void) {
-	bh_release_locked();
-	chThdSleepMilliseconds(20);
-	double sum = 0.0;
-	const int samples = 250;
-	for (int i = 0; i < samples; i++) {
-		sum += bh_sense_out_v();
-		chThdSleepMicroseconds(200);
-	}
-	return (float)(sum / (double)samples);
+	return bh_measure_sense_zero_samples(20, 250, 200);
 }
 
 static bh_lpoint_status_t bh_measure_l_point(float current, float freq,
@@ -38,9 +30,8 @@ static bh_lpoint_status_t bh_measure_l_point(float current, float freq,
 	out->a1_max = 0;
 
 	float sense_zero = bh_measure_sense_zero_quick();
-	if (bh_adc_clipped()) {
-		commands_printf("BH_LPOINT_ABORT A1 zero near rail raw=%u V=%.6f",
-				(unsigned)ADC_Value[ADC_IND_EXT], (double)sense_zero);
+	if (!bh_sense_zero_ok) {
+		commands_printf("BH_LPOINT_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
 		return BH_LPOINT_ABORT;
 	}
 
@@ -56,6 +47,8 @@ static bh_lpoint_status_t bh_measure_l_point(float current, float freq,
 	double i_dc = 0.0, v_dc = 0.0;
 	double s_sum = 0.0, c_sum = 0.0, wsum = 0.0;
 	bool headroom = false;
+	bh_adc_clip_reset();
+	bh_adc_headroom_reset();
 
 	while (!bh_stop_requested) {
 		uint32_t loop_start = timer_time_now();
@@ -71,19 +64,31 @@ static bh_lpoint_status_t bh_measure_l_point(float current, float freq,
 		t_prev = now;
 		float i_now = bh_coil_current();
 		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		bool hard_sample = bh_adc_sample_hard_rail(raw);
 		float vs = (bh_sense_out_v() - sense_zero) / BH_INA_GAIN;
 		if (raw < out->a1_min) out->a1_min = raw;
 		if (raw > out->a1_max) out->a1_max = raw;
 
-		// Preserve about 150 ADC counts of headroom on either rail. Reaching this
-		// threshold is not an electrical fault; it just means higher current at
-		// this frequency would no longer produce trustworthy search-coil data.
-		if (raw < 150U || raw > 3945U) {
+		/* Hard rail contact is now rate based: isolated glitches are ignored,
+		 * but >10 hard clips inside one second abort the measurement.
+		 */
+		if (bh_adc_clipped()) {
+			commands_printf("BH_LPOINT_ABORT sustained A1 clipping raw=%u (>10 hits/s)",
+					(unsigned)raw);
+			bh_release_locked();
+			return BH_LPOINT_ABORT;
+		}
+
+		/* The wider 150-count headroom margin is also rate based. A single
+		 * spurious peak no longer throws away the whole point; persistent margin
+		 * contact ends this frequency at the present current as before.
+		 */
+		if (bh_adc_headroom_exceeded(raw)) {
 			headroom = true;
 			break;
 		}
 
-		if (t >= measure_start && dt > 0.0f && dt < 0.02f) {
+		if (!hard_sample && t >= measure_start && dt > 0.0f && dt < 0.02f) {
 			float s = sinf(ph);
 			float c = cosf(ph);
 			i_s += (double)i_now * s * dt;
@@ -185,7 +190,7 @@ static bool bh_run_one(float freq, bool sine_wave, bool print_raw, bh_metrics_t 
 			return false;
 		}
 		if (st == BH_LPOINT_HEADROOM) {
-			commands_printf("BH_LPOINT_HEADROOM f=%.6f Hz Icmd=%.6f A A1min=%u A1max=%u; skipping higher currents at this frequency",
+			commands_printf("BH_LPOINT_HEADROOM f=%.6f Hz Icmd=%.6f A A1min=%u A1max=%u; >10 headroom hits/s, skipping higher currents at this frequency",
 					(double)freq, (double)current,
 					(unsigned)p.a1_min, (unsigned)p.a1_max);
 			break;
@@ -203,7 +208,7 @@ static bool bh_run_one(float freq, bool sine_wave, bool print_raw, bh_metrics_t 
 		any_ok = true;
 		point++;
 		current = bh_l_i_min * powf(2.0f, (float)point / bh_l_i_ppo);
-		chThdSleepMilliseconds(20);
+		bh_hold_hard_off_ms(20);
 	}
 
 	commands_printf("BH_LFREQ_DONE f=%.6f Hz points=%d", (double)freq, point);
