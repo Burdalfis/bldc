@@ -72,5 +72,6 @@ static void bh_init_commands(void) {
 
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
+#undef bh_release_locked
 
 #endif /* HW_MINI4_BH_H_ */
