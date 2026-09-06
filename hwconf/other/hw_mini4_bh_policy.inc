@@ -34,13 +34,32 @@ static void bh_keep_programmed_run_gains(mc_configuration *cfg) {
  *   2. We need the excitation winding genuinely undriven while measuring A1
  *      zero, not merely commanded to zero current.
  *
- * Every downstream tracer call that says bh_release_locked() therefore gets a
- * hard FOC PWM stop instead. mcpwm_foc_stop_pwm() sets control mode NONE,
- * state OFF and disables the bridge immediately. The worker already owns the
- * motor lock while these calls are made.
+ * There is a second trap: VESC's ordinary motor-timeout thread calls
+ * mc_interface_unlock() and then commands timeout_brake_current. With the usual
+ * 0 A timeout brake current and cc_min_current=0 that can restart active FOC
+ * zero-vector PWM in the middle of an otherwise static A1-zero measurement.
+ * Keep feeding the motor timeout while the tracer intentionally holds the
+ * bridge off, and reclaim the motor lock before checking/forcing MC_STATE_OFF.
  */
 static void bh_release_hard_off(void) {
+	timeout_reset();
+	mc_interface_lock();
 	mcpwm_foc_stop_pwm(false);
+}
+
+static inline void bh_keep_hard_off_alive(void) {
+	timeout_reset();
+	mc_interface_lock();
+	if (mc_interface_get_state() != MC_STATE_OFF) {
+		mcpwm_foc_stop_pwm(false);
+	}
+}
+
+static void bh_hold_hard_off_ms(int hold_ms) {
+	for (int i = 0; i < hold_ms && !bh_stop_requested; i++) {
+		bh_keep_hard_off_alive();
+		chThdSleepMilliseconds(1);
+	}
 }
 
 static float bh_programmed_current_bw_hz(void) {
