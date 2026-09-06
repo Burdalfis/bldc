@@ -147,9 +147,20 @@ static bool bh_live_plot(float freq) {
 }
 
 /* capture_v2 is compiled under these base names by hw_mini4_bh.h. Keep all of
- * its L-sweep behavior intact and intercept only an explicitly queued live run.
+ * its L-sweep behavior intact and intercept only explicitly queued live runs.
  */
 static bool bh_run_one(float freq, bool sine_wave, bool print_raw, bh_metrics_t *m) {
+	if (bh_fast_live_mode) {
+		(void)sine_wave;
+		(void)print_raw;
+		memset(m, 0, sizeof(*m));
+		bool ok = bh_fast_live_plot(freq);
+		m->valid = ok;
+		bh_fast_live_mode = false;
+		bh_live_suppress_metric = true;
+		return ok;
+	}
+
 	if (!bh_live_mode) {
 		return bh_run_one_v2_base(freq, sine_wave, print_raw, m);
 	}
