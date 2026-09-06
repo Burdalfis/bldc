@@ -3,6 +3,7 @@
 
 #include "utils_sys.h"
 #include "conf_general.h"
+#include "buffer.h"
 #include "hw_mini4_bh_core.inc"
 #include "hw_mini4_bh_policy.inc"
 
@@ -125,29 +126,81 @@ static inline float bh_fast_coil_current_median(void) {
     return b;
 }
 
-/* HFI plotting does not use a hidden bulk-packet transport. COMM_PLOT_DATA is
- * one x/y point per packet. The important difference is pacing: the HFI thread
- * wakes every 500 us, but only emits a plot burst every eighth pass (~4 ms).
- * Its DFT mode sends five graph points in that burst, i.e. about 1250 plot
- * packets/s, and then gets out of the way so USB and SampleSender can run.
+/*
+ * B-H live mode is launched by a terminal command. VESC keeps two reply
+ * transports: send_func (the most recently received ordinary packet) and
+ * send_func_blocking (the connection that launched the terminal command).
+ * commands_printf() already uses send_func_blocking, while the stock plot
+ * helpers use send_func. During a long-running tracer job VESC Tool continues
+ * issuing other commands, so send_func is not a stable ownership token for our
+ * unsolicited plot stream. This also explains why terminal status could remain
+ * live while Experiment Plot data appeared only after Stop changed the active
+ * command path again.
  *
- * Our cycle-buffered B-H plot used to dump hundreds of packets back-to-back.
- * That can keep the USB stream permanently backlogged even when the average
- * byte rate is reasonable. Keep every second display point, send five-point
- * bursts, then sleep 4 ms. Acquisition/current generation continue in the PWM
- * callback while this worker sleeps; completed plot cycles can simply be
- * dropped when the display cannot keep up.
+ * Encode the four tiny Experiment Plot packet types locally and send them on
+ * the same saved blocking reply transport as the terminal status. No extra
+ * queue or large buffer is needed. We keep every second display sample and no
+ * longer impose the old 4-ms sleeps; the completed-cycle double buffer already
+ * drops display cycles if USB cannot keep up. At the worst normal operating
+ * point this is only a few thousand ~10-byte plot packets per second.
  */
 static unsigned bh_fast_plot_tx_decim = 0U;
-static unsigned bh_fast_plot_tx_burst = 0U;
+static unsigned bh_fast_plot_tx_count = 0U;
+
+static inline void bh_fast_plot_init(const char *namex, const char *namey) {
+    uint8_t buffer[48];
+    size_t nx = strlen(namex);
+    size_t ny = strlen(namey);
+    if (nx + ny + 3U > sizeof(buffer)) {
+        return;
+    }
+    int32_t ind = 0;
+    buffer[ind++] = COMM_PLOT_INIT;
+    memcpy(buffer + ind, namex, nx);
+    ind += (int32_t)nx;
+    buffer[ind++] = '\0';
+    memcpy(buffer + ind, namey, ny);
+    ind += (int32_t)ny;
+    buffer[ind++] = '\0';
+    commands_send_packet_last_blocking(buffer, (unsigned)ind);
+}
+
+static inline void bh_fast_plot_add_graph(const char *name) {
+    uint8_t buffer[48];
+    size_t n = strlen(name);
+    if (n + 2U > sizeof(buffer)) {
+        return;
+    }
+    int32_t ind = 0;
+    buffer[ind++] = COMM_PLOT_ADD_GRAPH;
+    memcpy(buffer + ind, name, n);
+    ind += (int32_t)n;
+    buffer[ind++] = '\0';
+    commands_send_packet_last_blocking(buffer, (unsigned)ind);
+}
+
+static inline void bh_fast_plot_set_graph(int graph) {
+    uint8_t buffer[2];
+    buffer[0] = COMM_PLOT_SET_GRAPH;
+    buffer[1] = (uint8_t)graph;
+    commands_send_packet_last_blocking(buffer, sizeof(buffer));
+}
+
 static inline void bh_fast_send_plot_point(float x, float y) {
-    if ((bh_fast_plot_tx_decim++ & 1U) == 0U) {
-        commands_send_plot_points(x, y);
-        bh_fast_plot_tx_burst++;
-        if (bh_fast_plot_tx_burst >= 5U) {
-            bh_fast_plot_tx_burst = 0U;
-            chThdSleepMilliseconds(4);
-        }
+    if ((bh_fast_plot_tx_decim++ & 1U) != 0U) {
+        return;
+    }
+
+    uint8_t buffer[10];
+    int32_t ind = 0;
+    buffer[ind++] = COMM_PLOT_DATA;
+    buffer_append_float32_auto(buffer, x, &ind);
+    buffer_append_float32_auto(buffer, y, &ind);
+    commands_send_packet_last_blocking(buffer, (unsigned)ind);
+
+    bh_fast_plot_tx_count++;
+    if ((bh_fast_plot_tx_count & 15U) == 0U) {
+        chThdYield();
     }
 }
 
@@ -182,6 +235,9 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
 
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define bh_coil_current() bh_fast_coil_current_median()
+#define commands_init_plot(namex, namey) bh_fast_plot_init((namex), (namey))
+#define commands_plot_add_graph(name) bh_fast_plot_add_graph((name))
+#define commands_plot_set_graph(graph) bh_fast_plot_set_graph((graph))
 #define commands_send_plot_points(x, y) bh_fast_send_plot_point((x), (y))
 #define mc_interface_get_sampling_frequency_now() bh_fast_effective_sample_hz()
 #define mc_interface_set_pwm_callback(p_func) bh_fast_set_pwm_callback_mux(p_func)
@@ -191,6 +247,9 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
 #undef mc_interface_set_pwm_callback
 #undef mc_interface_get_sampling_frequency_now
 #undef commands_send_plot_points
+#undef commands_plot_set_graph
+#undef commands_plot_add_graph
+#undef commands_init_plot
 #undef bh_coil_current
 #undef bh_apply_current
 
