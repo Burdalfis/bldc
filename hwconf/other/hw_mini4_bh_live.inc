@@ -17,7 +17,6 @@ static bool bh_live_mode = false;
 static bool bh_live_suppress_metric = false;
 
 #define BH_LIVE_MAX_PLOT_POINTS_PER_CYCLE 400
-#define BH_LIVE_MAX_REFRESH_HZ             5.0f
 
 static bool bh_live_plot(float freq) {
 	float sense_zero = bh_measure_sense_zero();
@@ -46,31 +45,26 @@ static bool bh_live_plot(float freq) {
 	if (plot_div < 1) {
 		plot_div = 1;
 	}
-	const float plot_period = 1.0f / BH_LIVE_MAX_REFRESH_HZ;
 
 	commands_printf("BH_LIVE_START Ipk=%.6f A f=%.6f Hz path=%.6f mm area=%.6f mm^2 zero=%.7f V sense_mean=%.9f V sense=%+d plot_div=%d",
 			(double)bh_i_pk, (double)freq, (double)(bh_path_m * 1e3f),
 			(double)(bh_area_m2 * 1e6f), (double)sense_zero,
 			(double)sense_mean, bh_sense_polarity, plot_div);
-	commands_printf("BH_LIVE: Experiment Plot redraws one raw triangle-current B-H loop at a time; use VESC Tool Stop or bh_stop to finish.");
+	commands_printf("BH_LIVE: continuously appending raw triangle-current B-H loops; use Experiment Plot History to choose how many points/loops remain visible, and VESC Tool Stop or bh_stop to finish.");
 
-	bool first_plot = true;
+	/* Initialize Experiment Plot exactly once. Re-sending commands_init_plot()
+	 * clears VESC Tool's plot history, which defeats its History control. From
+	 * here onward we only append points; VESC Tool decides how many to retain.
+	 */
+	commands_init_plot("H (A/m)", "B relative (T)");
+	commands_plot_add_graph("B-H live");
+	commands_plot_set_graph(0);
+
 	bool seen_running = mc_interface_get_state() == MC_STATE_RUNNING;
 	bool external_stop = false;
-	uint32_t last_plot_start = timer_time_now();
 	bh_adc_clip_reset();
 
 	while (!bh_stop_requested) {
-		bool plot_this_cycle = first_plot ||
-				timer_seconds_elapsed_since(last_plot_start) >= plot_period;
-		if (plot_this_cycle) {
-			commands_init_plot("H (A/m)", "B relative (T)");
-			commands_plot_add_graph("B-H live");
-			commands_plot_set_graph(0);
-			last_plot_start = timer_time_now();
-			first_plot = false;
-		}
-
 		uint32_t t0 = timer_time_now();
 		uint32_t t_prev = t0;
 		float b_live = 0.0f;
@@ -114,7 +108,7 @@ static bool bh_live_plot(float freq) {
 				last_vs = vs;
 			}
 
-			if (plot_this_cycle && (sample_n % plot_div) == 0) {
+			if ((sample_n % plot_div) == 0) {
 				commands_send_plot_points(h, b_live);
 			}
 
@@ -215,7 +209,7 @@ static void terminal_bh_live(int argc, const char **argv) {
 static void bh_live_init_commands(void) {
 	terminal_register_command_callback(
 			"bh_live",
-			"Continuously redraw one raw B-H loop in Experiment Plot until VESC Tool Stop or bh_stop.",
+			"Continuously append raw B-H loops in Experiment Plot until VESC Tool Stop or bh_stop.",
 			"<Ipk_A> <freq_Hz> <path_mm> <area_mm2>",
 			terminal_bh_live);
 }
