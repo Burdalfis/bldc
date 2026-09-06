@@ -51,6 +51,7 @@ static inline void bh_rtos_sleep(float seconds) {
 #define bh_init_commands bh_init_commands_legacy
 #include "hw_mini4_bh_terminal.inc"
 #undef bh_init_commands
+#include "hw_mini4_bh_zero_diag.inc"
 #include "hw_mini4_bh_terminal_v2.inc"
 
 #undef bh_set_measurement_gains
