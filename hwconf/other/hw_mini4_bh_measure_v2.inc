@@ -15,14 +15,11 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 			(double)cfg->foc_current_kp, (double)cfg->foc_current_ki,
 			bh_sense_polarity);
 
-	// Keep the bridge released while finding the INA282 centre. The first motor
-	// RUNNING transition after this is therefore the beginning of the AC sine.
-	bh_release_locked();
-	chThdSleepMilliseconds(20);
+	// The shared zero sampler keeps the bridge genuinely OFF and feeds the
+	// normal VESC motor timeout so it cannot unlock us and restart 0-A FOC PWM.
 	float sense_zero = bh_measure_sense_zero();
-	if (bh_adc_clipped()) {
-		commands_printf("BH_RL_ABORT A1 zero near rail raw=%u V=%.6f",
-				(unsigned)ADC_Value[ADC_IND_EXT], (double)sense_zero);
+	if (!bh_sense_zero_ok) {
+		commands_printf("BH_RL_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
 		return false;
 	}
 
