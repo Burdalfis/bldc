@@ -116,7 +116,10 @@ static bh_lpoint_status_t bh_measure_l_point(float current, float freq,
 		}
 	}
 
-	bh_apply_current(0.0f);
+	/* Go directly from the driven sine state to the genuine bridge-off state.
+	 * Do not issue a 0-A FOC command first: with cc_min_current=0 that would
+	 * briefly re-enter active zero-vector PWM and can kick the INA output.
+	 */
 	bh_release_locked();
 	if (bh_stop_requested) {
 		return BH_LPOINT_ABORT;
