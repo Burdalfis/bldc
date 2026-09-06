@@ -31,6 +31,8 @@ static const char *bh_zero_mode_name(bh_zero_mode_t mode) {
 
 static void bh_zero_force_mode(bh_zero_mode_t mode) {
 	/* Always start from the real FOC-off state. */
+	timeout_reset();
+	mc_interface_lock();
 	mcpwm_foc_stop_pwm(false);
 
 	if (mode == BH_ZERO_FLOAT) {
@@ -96,12 +98,18 @@ static void bh_zero_collect_stats(bh_zero_mode_t mode, int hold_ms, bh_zero_stat
 	uint32_t t0 = timer_time_now();
 
 	while (timer_seconds_elapsed_since(t0) < (float)hold_ms * 1e-3f) {
-		/* Reissue active zero at roughly the same cadence as the tracer loops.
-		 * This both keeps the timeout alive and reproduces the actual command
-		 * path instead of merely leaving a stale control mode running.
+		/* Do not let VESC's ordinary motor timeout unlock this diagnostic and
+		 * overwrite a static bridge state with timeout_brake_current. For the
+		 * active FOC-zero mode, reissuing the current command already resets the
+		 * timeout. For the truly static modes we only reset timeout + reassert the
+		 * lock; do NOT call bh_keep_hard_off_alive(), because that would destroy
+		 * the intentionally forced low-side state we are measuring.
 		 */
 		if (mode == BH_ZERO_FOC_ZERO) {
 			bh_apply_current(0.0f);
+		} else {
+			timeout_reset();
+			mc_interface_lock();
 		}
 
 		uint16_t raw = ADC_Value[ADC_IND_EXT];
@@ -161,10 +169,19 @@ static bool bh_zero_parse_mode(const char *s, bh_zero_mode_t *mode) {
 
 static void bh_zero_run_one(bh_zero_mode_t mode, int hold_ms) {
 	bh_zero_force_mode(mode);
-	/* Give MOSFET/gate-driver transients and the INA output a moment to settle
-	 * before collecting statistics. Any long-lived instability remains visible.
+	/* Give MOSFET/gate-driver transients and the INA output a moment to settle.
+	 * Keep the normal motor timeout alive during this dwell too, otherwise a
+	 * short configured timeout can undo the state before statistics even start.
 	 */
-	chThdSleepMilliseconds(10);
+	for (int i = 0; i < 10; i++) {
+		if (mode == BH_ZERO_FOC_ZERO) {
+			bh_apply_current(0.0f);
+		} else {
+			timeout_reset();
+			mc_interface_lock();
+		}
+		chThdSleepMilliseconds(1);
+	}
 	bh_zero_stats_t st;
 	bh_zero_collect_stats(mode, hold_ms, &st);
 	bh_zero_print_stats(mode, &st);
@@ -188,10 +205,12 @@ static bool bh_zero_prepare_cfg(mc_configuration **old_out, mc_configuration **t
 	*test_cfg = *old_cfg;
 	bh_common_cfg(test_cfg, 1.0f);
 
+	timeout_reset();
 	mc_interface_lock();
 	mcpwm_foc_stop_pwm(false);
 	mc_interface_set_configuration(test_cfg);
-	chThdSleepMilliseconds(20);
+	bh_release_locked();
+	bh_hold_hard_off_ms(20);
 
 	*old_out = old_cfg;
 	*test_out = test_cfg;
@@ -199,9 +218,10 @@ static bool bh_zero_prepare_cfg(mc_configuration **old_out, mc_configuration **t
 }
 
 static void bh_zero_restore_cfg(mc_configuration *old_cfg, mc_configuration *test_cfg) {
-	mcpwm_foc_stop_pwm(false);
-	chThdSleepMilliseconds(5);
+	bh_release_locked();
+	bh_hold_hard_off_ms(5);
 	mc_interface_set_configuration(old_cfg);
+	bh_release_locked();
 	mc_interface_unlock();
 	mempools_free_mcconf(test_cfg);
 	mempools_free_mcconf(old_cfg);
