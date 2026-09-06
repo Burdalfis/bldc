@@ -254,6 +254,43 @@ void foc_pll_run(float phase, float dt, float *phase_var,
 		float *speed_var, mc_configuration *conf);
 void foc_svm(float alpha, float beta, float max_mod, uint32_t PWMFullDutyCycle,
 		uint32_t* tAout, uint32_t* tBout, uint32_t* tCout, uint32_t *svm_sector);
+
+/* MINI4 B-H tracer raw-modulation hook.
+ *
+ * The tracer needs to command a known alpha/beta voltage vector without going
+ * through VESC's current or duty controllers, but it still wants the ordinary
+ * foc_svm() path to own sector selection, complementary PWM timing, deadtime
+ * and current-sampling assumptions. The actual foc_svm() implementation stays
+ * untouched. Only callers that arrived through mcpwm_foc.h on this dedicated
+ * MINI4 tracer target are wrapped, so every other hardware target and
+ * foc_math.c itself continue to call the original function directly.
+ *
+ * The three globals are defined exactly once by hw_mini4_bh_fast.inc. They are
+ * updated from mc_interface's PWM-done callback, so a new vector is consumed
+ * on the following FOC cycle. When the override is false this wrapper is a
+ * transparent pass-through.
+ */
+#if defined(HW_MINI4_BH_TRACER) && defined(MCPWM_FOC_H_)
+extern volatile bool bh_foc_svm_override_active;
+extern volatile float bh_foc_svm_override_alpha;
+extern volatile float bh_foc_svm_override_beta;
+
+static inline void foc_svm_bh_override(float alpha, float beta, float max_mod,
+		uint32_t PWMFullDutyCycle, uint32_t *tAout, uint32_t *tBout,
+		uint32_t *tCout, uint32_t *svm_sector) {
+	if (bh_foc_svm_override_active) {
+		alpha = bh_foc_svm_override_alpha;
+		beta = bh_foc_svm_override_beta;
+	}
+	foc_svm(alpha, beta, max_mod, PWMFullDutyCycle,
+			tAout, tBout, tCout, svm_sector);
+}
+
+#define foc_svm(alpha, beta, max_mod, pwm_full, ta, tb, tc, sector) \
+	foc_svm_bh_override((alpha), (beta), (max_mod), (pwm_full), \
+			(ta), (tb), (tc), (sector))
+#endif
+
 void foc_run_pid_control_pos(bool index_found, float dt, motor_all_state_t *motor);
 void foc_run_pid_control_speed(bool index_found, float dt, motor_all_state_t *motor);
 float foc_correct_encoder(float obs_angle, float enc_angle, float speed, float sl_erpm, motor_all_state_t *motor);
