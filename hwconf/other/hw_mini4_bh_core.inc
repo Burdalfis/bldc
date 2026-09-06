@@ -56,6 +56,10 @@
 
 #define BH_A1_RAW_MIN                40
 #define BH_A1_RAW_MAX                4055
+#define BH_A1_HEADROOM_MIN           150
+#define BH_A1_HEADROOM_MAX           3945
+#define BH_A1_MAX_EVENTS_PER_SEC     10
+#define BH_A1_EVENT_SLOTS            (BH_A1_MAX_EVENTS_PER_SEC + 1)
 
 #define BH_KP_MAX                    0.20f
 #define BH_KI_MAX                    200.0f
@@ -84,6 +88,12 @@ typedef struct {
 	bool valid;
 } bh_metrics_t;
 
+typedef struct {
+	uint32_t stamp[BH_A1_EVENT_SLOTS];
+	uint8_t next;
+	uint8_t count;
+} bh_a1_rate_guard_t;
+
 // Float formatting, configuration changes and the analysis helpers can nest
 // fairly deeply. Give this diagnostic thread ample stack so a test cannot turn
 // a marginal stack into a hard fault/reset.
@@ -107,6 +117,9 @@ static float bh_rl_freq = BH_RL_DEFAULT_FREQ_HZ;
 static float bh_r_line_ohm = 0.0f;
 static float bh_l_line_h = 0.0f;
 static bool bh_rl_valid = false;
+
+static bh_a1_rate_guard_t bh_a1_hard_guard;
+static bh_a1_rate_guard_t bh_a1_headroom_guard;
 
 static THD_FUNCTION(bh_thread, arg);
 
@@ -140,9 +153,57 @@ static inline float bh_line_voltage(void) {
 	return BH_SQRT3 * mcpwm_foc_get_vd();
 }
 
-static inline bool bh_adc_clipped(void) {
-	uint16_t raw = ADC_Value[ADC_IND_EXT];
+static inline void bh_a1_rate_guard_reset(bh_a1_rate_guard_t *guard) {
+	memset(guard, 0, sizeof(*guard));
+}
+
+/* Return true only when more than BH_A1_MAX_EVENTS_PER_SEC out-of-range
+ * samples have occurred inside a rolling one-second span. One-off ADC spikes
+ * therefore do not kill a run, while sustained rail contact still does.
+ */
+static inline bool bh_a1_rate_guard_record(bh_a1_rate_guard_t *guard,
+		uint16_t raw, uint16_t lo, uint16_t hi) {
+	if (raw >= lo && raw <= hi) {
+		return false;
+	}
+
+	uint32_t now = timer_time_now();
+	guard->stamp[guard->next] = now;
+	guard->next++;
+	if (guard->next >= BH_A1_EVENT_SLOTS) {
+		guard->next = 0;
+	}
+	if (guard->count < BH_A1_EVENT_SLOTS) {
+		guard->count++;
+	}
+	if (guard->count < BH_A1_EVENT_SLOTS) {
+		return false;
+	}
+
+	// Once full, next points at the oldest of the last 11 excursions.
+	return timer_calc_diff(guard->stamp[guard->next], now) <= 1.0f;
+}
+
+static inline bool bh_adc_sample_hard_rail(uint16_t raw) {
 	return raw < BH_A1_RAW_MIN || raw > BH_A1_RAW_MAX;
+}
+
+static inline void bh_adc_clip_reset(void) {
+	bh_a1_rate_guard_reset(&bh_a1_hard_guard);
+}
+
+static inline bool bh_adc_clipped(void) {
+	return bh_a1_rate_guard_record(&bh_a1_hard_guard,
+			ADC_Value[ADC_IND_EXT], BH_A1_RAW_MIN, BH_A1_RAW_MAX);
+}
+
+static inline void bh_adc_headroom_reset(void) {
+	bh_a1_rate_guard_reset(&bh_a1_headroom_guard);
+}
+
+static inline bool bh_adc_headroom_exceeded(uint16_t raw) {
+	return bh_a1_rate_guard_record(&bh_a1_headroom_guard,
+			raw, BH_A1_HEADROOM_MIN, BH_A1_HEADROOM_MAX);
 }
 
 static inline void bh_apply_current(float i_line) {
