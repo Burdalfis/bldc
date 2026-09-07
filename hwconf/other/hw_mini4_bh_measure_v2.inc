@@ -15,35 +15,35 @@
 
 /* Nonlinear active-PWM feedthrough calibration. At settled DC excitation the
  * true search-coil voltage is zero, so A1-active minus A1-hard-off is entirely
- * fixture/controller feedthrough. Vd is used as the independent variable because
- * it directly describes the bridge modulation operating point in this fixed-axis
- * fixture. Segment slopes are precomputed so the hot fast-acquisition path does
- * not perform a floating-point division for interpolation.
+ * fixture/controller feedthrough. Measured coil current is the independent
+ * variable: unlike Vd it does not acquire an L*dI/dt term during live AC drive.
+ * Segment slopes are precomputed so the hot fast-acquisition path does not
+ * perform a floating-point division for interpolation.
  */
-static float bh_sense_pwm_vd_lut[BH_A1_PWM_LUT_POINTS];
+static float bh_sense_pwm_i_lut[BH_A1_PWM_LUT_POINTS];
 static float bh_sense_pwm_err_lut[BH_A1_PWM_LUT_POINTS];
 static float bh_sense_pwm_slope_lut[BH_A1_PWM_LUT_SEGMENTS];
 static bool bh_sense_pwm_lut_valid = false;
 
-static inline float bh_sense_pwm_lut_error_v(float vd) {
+static inline float bh_sense_pwm_lut_error_v(float i_line) {
 	if (!bh_sense_pwm_lut_valid) {
 		return 0.0f;
 	}
-	if (vd <= bh_sense_pwm_vd_lut[0]) {
+	if (i_line <= bh_sense_pwm_i_lut[0]) {
 		return bh_sense_pwm_err_lut[0];
 	}
-	if (vd >= bh_sense_pwm_vd_lut[BH_A1_PWM_LUT_POINTS - 1]) {
+	if (i_line >= bh_sense_pwm_i_lut[BH_A1_PWM_LUT_POINTS - 1]) {
 		return bh_sense_pwm_err_lut[BH_A1_PWM_LUT_POINTS - 1];
 	}
 
 	int seg = 0;
 	while (seg < BH_A1_PWM_LUT_SEGMENTS - 1 &&
-			vd > bh_sense_pwm_vd_lut[seg + 1]) {
+			i_line > bh_sense_pwm_i_lut[seg + 1]) {
 		seg++;
 	}
 	return bh_sense_pwm_err_lut[seg] +
 			bh_sense_pwm_slope_lut[seg] *
-			(vd - bh_sense_pwm_vd_lut[seg]);
+			(i_line - bh_sense_pwm_i_lut[seg]);
 }
 
 /* Shorter DC sample point for the 11-point resistance/feedthrough sweep. Every
@@ -105,7 +105,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 
 	// Do not carry an old feedthrough LUT through a failed/incomplete R test.
 	bh_sense_pwm_lut_valid = false;
-	memset(bh_sense_pwm_vd_lut, 0, sizeof(bh_sense_pwm_vd_lut));
+	memset(bh_sense_pwm_i_lut, 0, sizeof(bh_sense_pwm_i_lut));
 	memset(bh_sense_pwm_err_lut, 0, sizeof(bh_sense_pwm_err_lut));
 	memset(bh_sense_pwm_slope_lut, 0, sizeof(bh_sense_pwm_slope_lut));
 
@@ -147,10 +147,10 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 		return false;
 	}
 
-	commands_printf("BH_RL_STAGE R_A1_LUT_START points=%d A1off=%.7f V",
+	commands_printf("BH_RL_STAGE R_A1_LUT_START points=%d A1off=%.7f V axis=Icoil",
 			BH_A1_PWM_LUT_POINTS, (double)dc_sense_zero);
 
-	float lut_vd[BH_A1_PWM_LUT_POINTS];
+	float lut_i[BH_A1_PWM_LUT_POINTS];
 	float lut_err[BH_A1_PWM_LUT_POINTS];
 	double si = 0.0, sv = 0.0, sii = 0.0, siv = 0.0;
 
@@ -168,7 +168,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 		}
 
 		float err = a1 - dc_sense_zero;
-		lut_vd[n] = vd;
+		lut_i[n] = ia;
 		lut_err[n] = err;
 		commands_printf("BH_R_POINT idx=%d frac=%+.3f I=%+.7f A Vd=%+.7f V Vab=%+.7f V duty=%+.6f A1=%.7f V Err=%+.6f mV",
 				n, (double)frac, (double)ia, (double)vd, (double)vab,
@@ -197,59 +197,58 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 	commands_printf("BH_RL_STAGE R_DONE Rline=%.6f mOhm Voff=%.6f V",
 			(double)(r_line * 1e3f), (double)v_offset);
 
-	/* Sort the calibration by measured Vd rather than assuming current order is
-	 * perfectly monotonic. This makes the live piecewise-linear interpolation
-	 * robust to small current-control asymmetry around zero.
+	/* Sort by measured current rather than assuming command order is perfectly
+	 * monotonic. This keeps interpolation robust to current-control asymmetry.
 	 */
 	for (int i = 1; i < BH_A1_PWM_LUT_POINTS; i++) {
-		float vd_key = lut_vd[i];
+		float i_key = lut_i[i];
 		float err_key = lut_err[i];
 		int j = i - 1;
-		while (j >= 0 && lut_vd[j] > vd_key) {
-			lut_vd[j + 1] = lut_vd[j];
+		while (j >= 0 && lut_i[j] > i_key) {
+			lut_i[j + 1] = lut_i[j];
 			lut_err[j + 1] = lut_err[j];
 			j--;
 		}
-		lut_vd[j + 1] = vd_key;
+		lut_i[j + 1] = i_key;
 		lut_err[j + 1] = err_key;
 	}
 
 	bool lut_ok = true;
 	for (int i = 0; i < BH_A1_PWM_LUT_POINTS; i++) {
-		if (!isfinite(lut_vd[i]) || !isfinite(lut_err[i]) ||
+		if (!isfinite(lut_i[i]) || !isfinite(lut_err[i]) ||
 				fabsf(lut_err[i]) > 1.0f) {
 			lut_ok = false;
 		}
-		if (i > 0 && lut_vd[i] - lut_vd[i - 1] < 1.0e-5f) {
+		if (i > 0 && lut_i[i] - lut_i[i - 1] < 1.0e-4f) {
 			lut_ok = false;
 		}
 	}
 
 	if (lut_ok) {
 		for (int i = 0; i < BH_A1_PWM_LUT_POINTS; i++) {
-			bh_sense_pwm_vd_lut[i] = lut_vd[i];
+			bh_sense_pwm_i_lut[i] = lut_i[i];
 			bh_sense_pwm_err_lut[i] = lut_err[i];
 		}
 		for (int i = 0; i < BH_A1_PWM_LUT_SEGMENTS; i++) {
-			float dv = bh_sense_pwm_vd_lut[i + 1] -
-					bh_sense_pwm_vd_lut[i];
+			float di = bh_sense_pwm_i_lut[i + 1] -
+					bh_sense_pwm_i_lut[i];
 			bh_sense_pwm_slope_lut[i] =
 					(bh_sense_pwm_err_lut[i + 1] -
-					 bh_sense_pwm_err_lut[i]) / dv;
+					 bh_sense_pwm_err_lut[i]) / di;
 		}
 		bh_sense_pwm_lut_valid = true;
-		commands_printf("BH_A1_PWM_LUT valid points=%d Vd=[%+.7f,%+.7f] V A1off=%.7f V",
+		commands_printf("BH_A1_PWM_LUT valid points=%d I=[%+.7f,%+.7f] A A1off=%.7f V",
 				BH_A1_PWM_LUT_POINTS,
-				(double)bh_sense_pwm_vd_lut[0],
-				(double)bh_sense_pwm_vd_lut[BH_A1_PWM_LUT_POINTS - 1],
+				(double)bh_sense_pwm_i_lut[0],
+				(double)bh_sense_pwm_i_lut[BH_A1_PWM_LUT_POINTS - 1],
 				(double)dc_sense_zero);
 		for (int i = 0; i < BH_A1_PWM_LUT_POINTS; i++) {
-			commands_printf("BH_A1_LUT idx=%d Vd=%+.7f V Err=%+.6f mV",
-					i, (double)bh_sense_pwm_vd_lut[i],
+			commands_printf("BH_A1_LUT idx=%d I=%+.7f A Err=%+.6f mV",
+					i, (double)bh_sense_pwm_i_lut[i],
 					(double)(bh_sense_pwm_err_lut[i] * 1e3f));
 		}
 	} else {
-		commands_printf("BH_A1_PWM_LUT rejected: non-finite, excessive error, or non-distinct Vd points; live compensation disabled");
+		commands_printf("BH_A1_PWM_LUT rejected: non-finite, excessive error, or non-distinct current points; live compensation disabled");
 	}
 
 	float tracking = 100.0f * final.i_amp / ac_current;
