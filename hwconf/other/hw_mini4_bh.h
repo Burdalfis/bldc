@@ -3,7 +3,6 @@
 
 #include "utils_sys.h"
 #include "conf_general.h"
-#include "buffer.h"
 #include "hw_mini4_bh_core.inc"
 #include "hw_mini4_bh_policy.inc"
 
@@ -90,14 +89,17 @@ static bool bh_fast_live_plot(float freq);
 #undef timer_sleep
 
 /* Give the fast-mode startup call a harmless nonzero target so FOC is already
- * in MC_STATE_RUNNING before its PWM callback takes over the reference. The
- * callback immediately replaces this with the real triangle-current target.
+ * in MC_STATE_RUNNING before its PWM callback takes over the reference. Once
+ * the callback owns the current reference, unlock ordinary mc_interface input
+ * so VESC Tool's Stop/release command can actually reach FOC. Any accidental
+ * non-stop motor command is overwritten again on the very next PWM callback.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
         i_line = 0.010f;
     }
     bh_apply_current(i_line);
+    mc_interface_unlock();
 }
 
 /* Fast mode sees raw phase-current samples at PWM cadence. Isolated switching
@@ -126,80 +128,32 @@ static inline float bh_fast_coil_current_median(void) {
     return b;
 }
 
-/*
- * B-H live mode is launched by a terminal command. VESC keeps two reply
- * transports: send_func (the most recently received ordinary packet) and
- * send_func_blocking (the connection that launched the terminal command).
- * commands_printf() already uses send_func_blocking, while the stock plot
- * helpers use send_func. During a long-running tracer job VESC Tool continues
- * issuing other commands, so send_func is not a stable ownership token for our
- * unsolicited plot stream. This also explains why terminal status could remain
- * live while Experiment Plot data appeared only after Stop changed the active
- * command path again.
+/* Use the same ordinary asynchronous COMM_PLOT_DATA path as VESC's HFI plot.
+ * The failed experiment used commands_send_packet_last_blocking(), which tied
+ * every point to the terminal-command reply transport and could congest command
+ * handling badly enough that Stop itself was delayed.
  *
- * Encode the four tiny Experiment Plot packet types locally and send them on
- * the same saved blocking reply transport as the terminal status. No extra
- * queue or large buffer is needed. We keep every second display sample and no
- * longer impose the old 4-ms sleeps; the completed-cycle double buffer already
- * drops display cycles if USB cannot keep up. At the worst normal operating
- * point this is only a few thousand ~10-byte plot packets per second.
+ * We keep every second display point (up to about 4k packets/s at the current
+ * 20 displayed-loop/s cap), but never sleep inside a completed-cycle dump.
+ * Instead yield after four packets. That lets SampleSender and other equal-
+ * priority housekeeping run while USB drains, without stalling PWM-rate H/B
+ * acquisition. If Stop arrives mid-cycle, the remaining buffered points are
+ * simply discarded rather than flushed after the drive has been stopped.
  */
 static unsigned bh_fast_plot_tx_decim = 0U;
-static unsigned bh_fast_plot_tx_count = 0U;
-
-static inline void bh_fast_plot_init(const char *namex, const char *namey) {
-    uint8_t buffer[48];
-    size_t nx = strlen(namex);
-    size_t ny = strlen(namey);
-    if (nx + ny + 3U > sizeof(buffer)) {
-        return;
-    }
-    int32_t ind = 0;
-    buffer[ind++] = COMM_PLOT_INIT;
-    memcpy(buffer + ind, namex, nx);
-    ind += (int32_t)nx;
-    buffer[ind++] = '\0';
-    memcpy(buffer + ind, namey, ny);
-    ind += (int32_t)ny;
-    buffer[ind++] = '\0';
-    commands_send_packet_last_blocking(buffer, (unsigned)ind);
-}
-
-static inline void bh_fast_plot_add_graph(const char *name) {
-    uint8_t buffer[48];
-    size_t n = strlen(name);
-    if (n + 2U > sizeof(buffer)) {
-        return;
-    }
-    int32_t ind = 0;
-    buffer[ind++] = COMM_PLOT_ADD_GRAPH;
-    memcpy(buffer + ind, name, n);
-    ind += (int32_t)n;
-    buffer[ind++] = '\0';
-    commands_send_packet_last_blocking(buffer, (unsigned)ind);
-}
-
-static inline void bh_fast_plot_set_graph(int graph) {
-    uint8_t buffer[2];
-    buffer[0] = COMM_PLOT_SET_GRAPH;
-    buffer[1] = (uint8_t)graph;
-    commands_send_packet_last_blocking(buffer, sizeof(buffer));
-}
-
+static unsigned bh_fast_plot_tx_yield = 0U;
 static inline void bh_fast_send_plot_point(float x, float y) {
+    if (bh_stop_requested) {
+        return;
+    }
     if ((bh_fast_plot_tx_decim++ & 1U) != 0U) {
         return;
     }
 
-    uint8_t buffer[10];
-    int32_t ind = 0;
-    buffer[ind++] = COMM_PLOT_DATA;
-    buffer_append_float32_auto(buffer, x, &ind);
-    buffer_append_float32_auto(buffer, y, &ind);
-    commands_send_packet_last_blocking(buffer, (unsigned)ind);
-
-    bh_fast_plot_tx_count++;
-    if ((bh_fast_plot_tx_count & 15U) == 0U) {
+    commands_send_plot_points(x, y);
+    bh_fast_plot_tx_yield++;
+    if (bh_fast_plot_tx_yield >= 4U) {
+        bh_fast_plot_tx_yield = 0U;
         chThdYield();
     }
 }
@@ -233,23 +187,25 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
     }
 }
 
+/* The worker locks normal motor input while configuring the fixture. Fast mode
+ * deliberately unlocks once its PWM callback owns the reference so VESC Tool
+ * Stop can release the motor. Do not immediately re-lock it in the 1-ms live
+ * loop; worker_v2's hard-off cleanup locks again before restoring the user's
+ * configuration.
+ */
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define bh_coil_current() bh_fast_coil_current_median()
-#define commands_init_plot(namex, namey) bh_fast_plot_init((namex), (namey))
-#define commands_plot_add_graph(name) bh_fast_plot_add_graph((name))
-#define commands_plot_set_graph(graph) bh_fast_plot_set_graph((graph))
 #define commands_send_plot_points(x, y) bh_fast_send_plot_point((x), (y))
 #define mc_interface_get_sampling_frequency_now() bh_fast_effective_sample_hz()
 #define mc_interface_set_pwm_callback(p_func) bh_fast_set_pwm_callback_mux(p_func)
+#define mc_interface_lock() ((void)0)
 #define bh_fast_pwm_callback bh_fast_pwm_callback_core
 #include "hw_mini4_bh_fast.inc"
 #undef bh_fast_pwm_callback
+#undef mc_interface_lock
 #undef mc_interface_set_pwm_callback
 #undef mc_interface_get_sampling_frequency_now
 #undef commands_send_plot_points
-#undef commands_plot_set_graph
-#undef commands_plot_add_graph
-#undef commands_init_plot
 #undef bh_coil_current
 #undef bh_apply_current
 
