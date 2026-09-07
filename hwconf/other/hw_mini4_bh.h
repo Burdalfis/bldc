@@ -110,8 +110,8 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
  * never a catch-up burst. With the normal 1 ms loop and a 4 ms period the hard
  * transport budget is approximately 250 H/B points per second.
  *
- * chThdSleepMilliseconds() in this function is resolved before the temporary
- * macro below is defined, so it remains the real ChibiOS sleep implementation.
+ * This helper is defined while ChibiOS's original sleep macro is still active,
+ * so its final statement preprocesses to chThdSleep(MS2ST(sleep_ms)).
  */
 static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
     if (bh_fast_active) {
@@ -149,9 +149,11 @@ static void bh_fast_pwm_callback(void);
  */
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define mc_interface_lock() ((void)0)
+#undef chThdSleepMilliseconds
 #define chThdSleepMilliseconds(ms) bh_fast_worker_plot_sleep((unsigned)(ms))
 #include "hw_mini4_bh_fast.inc"
 #undef chThdSleepMilliseconds
+#define chThdSleepMilliseconds(msec) chThdSleep(MS2ST(msec))
 #undef mc_interface_lock
 #undef bh_apply_current
 
