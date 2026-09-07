@@ -90,9 +90,8 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
     mc_interface_unlock();
 }
 
-/* CPU-load diagnostic: the full H/B acquisition implementation was removed
- * from hw_mini4_bh_fast.inc for this test. The only extra PWM callback is the
- * stripped current-reference/sanity path defined below.
+/* Fast mode uses the decimated callback below for both reference generation and
+ * H/B acquisition. Experiment Plot transport is still intentionally absent.
  */
 static void bh_fast_pwm_callback(void);
 
@@ -107,13 +106,11 @@ static void bh_fast_pwm_callback(void);
 #undef mc_interface_lock
 #undef bh_apply_current
 
-/* CPU-load diagnostic callback. VESC's FOC/current PI continues running at its
- * normal full cadence, but this tracer-specific work runs only every
- * BH_FAST_DIAG_DIV callbacks. At div=2 and ~15 kHz FOC that is ~7.5 kHz.
- *
- * Built-in VESC current/fault protection remains full-rate. This diagnostic's
- * additional state/fault/overcurrent checks have at most one skipped FOC period
- * of extra latency at div=2.
+/* VESC's FOC/current PI continues running at its normal full cadence. This
+ * tracer-specific callback runs only every BH_FAST_DIAG_DIV FOC callbacks and
+ * now performs the representative INA282/current filtering plus H/B integration
+ * at that same decimated rate. Plot/USB transmission remains disabled so the
+ * CPU cost measured here is acquisition rather than transport.
  */
 static void bh_fast_pwm_callback(void) {
     if (!bh_fast_active) {
@@ -137,23 +134,8 @@ static void bh_fast_pwm_callback(void) {
         return;
     }
 
-    /* Raw measured current is sufficient for this CPU diagnostic. The previous
-     * 3-sample median was useful for H/B acquisition but needlessly spent CPU
-     * while we are only tracking amplitude and enforcing a coarse sanity limit.
-     */
-    float i_now = bh_coil_current();
-    if (i_now > bh_fast_cycle_i_max) bh_fast_cycle_i_max = i_now;
-    if (i_now < bh_fast_cycle_i_min) bh_fast_cycle_i_min = i_now;
-
-    if (fabsf(i_now) > bh_fast_oc_lim) {
-        bh_fast_overcurrent_count++;
-        if (bh_fast_overcurrent_count >= BH_FAST_OVERCURRENT_SAMPLES) {
-            bh_fast_overcurrent_abort = true;
-            bh_fast_abort_drive();
-            return;
-        }
-    } else {
-        bh_fast_overcurrent_count = 0;
+    if (!bh_fast_acquire_sample()) {
+        return;
     }
 
     bh_fast_sample_n++;
@@ -166,6 +148,13 @@ static void bh_fast_pwm_callback(void) {
         bh_fast_cycle_i_min = 1.0e30f;
         bh_fast_sample_n = 0;
         next_phase -= 1.0f;
+
+        /* B is intentionally relative per cycle in this diagnostic. Keep the
+         * median histories warm, but restart trapezoidal integration cleanly at
+         * the cycle boundary to prevent accumulated offset drift.
+         */
+        bh_fast_b = 0.0f;
+        bh_fast_have_vmed = false;
     }
     bh_fast_phase = next_phase;
 
