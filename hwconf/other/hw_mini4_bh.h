@@ -131,40 +131,28 @@ static inline float bh_fast_coil_current_median(void) {
 }
 
 /* CPU-load diagnostic: intentionally suppress every fast-mode Experiment Plot
- * data packet while leaving the PWM-rate current generator, A1/current
- * acquisition, B integration, cycle buffering, closure/centering, protections
- * and once-per-second terminal statistics unchanged. This isolates the cost of
- * COMM_PLOT_DATA transport from the actual magnetic measurement path.
- *
- * The plot is still initialized by bh_fast_live_plot(), and completed cycles
- * are still drained/processed by bh_fast_plot_ready_cycle(); only the final
- * commands_send_plot_points() transport operation is turned into a no-op.
+ * data packet. The next diagnostic layer below also bypasses fast H/B
+ * acquisition in the PWM callback, leaving only the triangle current-reference
+ * generator, current tracking/sanity check, Stop handling and normal VESC FOC.
  */
 static inline void bh_fast_send_plot_point(float x, float y) {
     (void)x;
     (void)y;
 }
 
-/* Run the extra B-H generator/acquisition callback at the full FOC callback
- * cadence. The previous voltage-drive prototype used every second callback to
- * save ISR time; the current-reference generator is much lighter and benefits
- * directly from updating its target on every control cycle.
- */
+/* Run the extra B-H callback at the full FOC callback cadence. */
 static inline float bh_fast_effective_sample_hz(void) {
     return mc_interface_get_sampling_frequency_now();
 }
 
-/* terminal_v2 normally owns the single mc_interface PWM callback so Sampled
- * Data phase 3 can display INA282 OUT. bh_live_fast also needs that callback
- * for its generator. Multiplex the two during fast mode, then restore the
- * scope callback on exit instead of leaving the callback slot empty.
+/* During the CPU diagnostic, do not also run the INA282 Sampled Data overlay
+ * from the fast callback. It is restored when fast mode exits.
  */
 static void bh_fast_pwm_callback(void);
 static void bh_fast_pwm_callback_core(void);
 static void bh_sample_scope_pwm_cb(void);
 static void bh_fast_pwm_callback_mux(void) {
     bh_fast_pwm_callback();
-    bh_sample_scope_pwm_cb();
 }
 static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
     if (p_func) {
@@ -196,11 +184,57 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
 #undef bh_coil_current
 #undef bh_apply_current
 
-/* Full-rate wrapper kept separate so the mux can continue presenting the INA
- * scope overlay at the same cadence as the current-reference generator.
+/* CPU-load diagnostic callback: keep only the PWM-rate triangle reference and
+ * measured-current safety/tracking. The original bh_fast_pwm_callback_core()
+ * remains compiled above but is intentionally not called in this build.
  */
 static void bh_fast_pwm_callback(void) {
-    bh_fast_pwm_callback_core();
+    if (!bh_fast_active) {
+        return;
+    }
+
+    if (mc_interface_get_state() != MC_STATE_RUNNING) {
+        bh_fast_external_stop = true;
+        bh_fast_active = false;
+        return;
+    }
+
+    if (bh_stop_requested || mc_interface_get_fault() != FAULT_CODE_NONE) {
+        bh_fast_abort_drive();
+        return;
+    }
+
+    float i_now = bh_fast_coil_current_median();
+    if (i_now > bh_fast_cycle_i_max) bh_fast_cycle_i_max = i_now;
+    if (i_now < bh_fast_cycle_i_min) bh_fast_cycle_i_min = i_now;
+
+    float ai = fabsf(i_now);
+    float oc_lim = fmaxf(bh_i_pk * 1.50f, bh_i_pk + 0.75f);
+    if (ai > oc_lim) {
+        bh_fast_overcurrent_count++;
+        if (bh_fast_overcurrent_count >= BH_FAST_OVERCURRENT_SAMPLES) {
+            bh_fast_overcurrent_abort = true;
+            bh_fast_abort_drive();
+            return;
+        }
+    } else {
+        bh_fast_overcurrent_count = 0;
+    }
+
+    bh_fast_sample_n++;
+    float next_phase = bh_fast_phase + bh_fast_phase_step;
+    if (next_phase >= 1.0f) {
+        bh_fast_last_amp = 0.5f * (bh_fast_cycle_i_max - bh_fast_cycle_i_min);
+        bh_fast_last_center = 0.5f * (bh_fast_cycle_i_max + bh_fast_cycle_i_min);
+        bh_fast_cycle_n++;
+        bh_fast_cycle_i_max = -1.0e30f;
+        bh_fast_cycle_i_min = 1.0e30f;
+        bh_fast_sample_n = 0;
+        next_phase -= 1.0f;
+    }
+    bh_fast_phase = next_phase;
+
+    bh_fast_set_current_ref(bh_i_pk * bh_fast_triangle(bh_fast_phase));
 }
 
 #include "hw_mini4_bh_worker_v2.inc"
