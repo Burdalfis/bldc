@@ -87,31 +87,43 @@ static volatile float bh_fast_last_b;
 
 #define BH_FAST_PLOT_PERIOD_MS 4U
 #define BH_FAST_BIAS_TRACK_ALPHA 0.125f
+#define BH_FAST_CENTER_TRACK_ALPHA 0.125f
 static bool bh_fast_plot_started = false;
 static unsigned bh_fast_plot_elapsed_ms = 0U;
 
-/* One complete excitation cycle is used to estimate residual search-voltage
- * bias before plotting begins. Thereafter the previous cycle's residual mean
- * gently trims the INA zero reference for the next cycle. B itself is never
- * reset after that initial calibration cycle, so plotted loops stay continuous.
+/* Calibration/centering state:
+ *   cycle 1: estimate residual volt-second bias; no plot
+ *   cycle 2: integrate with that bias removed, measure Bmin/Bmax; no plot
+ *   cycle 3+: plot B - Bcenter while gently tracking residual bias and center
+ *
+ * The raw B integrator is continuous after cycle 1. Bcenter is only the
+ * arbitrary integration constant presented to Experiment Plot.
  */
 static volatile bool bh_fast_bias_ready = false;
+static volatile bool bh_fast_center_ready = false;
 static float bh_fast_cycle_vsum = 0.0f;
 static unsigned bh_fast_cycle_vcount = 0U;
+static float bh_fast_b_center = 0.0f;
+static float bh_fast_cycle_b_min = 1.0e30f;
+static float bh_fast_cycle_b_max = -1.0e30f;
 
 /* Give fast-mode startup a harmless nonzero target so FOC is already RUNNING
  * before its callback takes over. Once the callback owns the current reference,
  * unlock ordinary mc_interface input so VESC Tool Stop/release can reach FOC.
- * Reset plot/bias state here as this startup-only path runs once per fast-live
- * job, before the PWM callback is installed.
+ * Reset plot/calibration state here as this startup-only path runs once per
+ * fast-live job, before the PWM callback is installed.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
         bh_fast_plot_started = false;
         bh_fast_plot_elapsed_ms = 0U;
         bh_fast_bias_ready = false;
+        bh_fast_center_ready = false;
         bh_fast_cycle_vsum = 0.0f;
         bh_fast_cycle_vcount = 0U;
+        bh_fast_b_center = 0.0f;
+        bh_fast_cycle_b_min = 1.0e30f;
+        bh_fast_cycle_b_max = -1.0e30f;
         i_line = 0.010f;
     }
     bh_apply_current(i_line);
@@ -124,20 +136,20 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
  * never a catch-up burst. With the normal 1 ms loop and a 4 ms period the hard
  * transport budget is approximately 250 H/B points per second.
  *
- * Do not initialize or send the plot until the first full excitation cycle has
- * established a residual search-voltage bias. This keeps the one intentional
- * startup B-zero calibration out of the visible plot history.
+ * Do not initialize or send the plot until both hidden calibration cycles have
+ * completed. The first visible point therefore already uses a volt-second bias
+ * estimate and a centered B origin.
  *
  * This helper is defined while ChibiOS's original sleep macro is still active,
  * so its final statement preprocesses to chThdSleep(MS2ST(sleep_ms)).
  */
 static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
-    if (bh_fast_active && bh_fast_bias_ready) {
+    if (bh_fast_active && bh_fast_center_ready) {
         if (!bh_fast_plot_started) {
             commands_init_plot("H (A/m)", "B relative (T)");
             commands_plot_add_graph("B-H fast live");
             commands_plot_set_graph(0);
-            commands_printf("BH_FAST_PLOT worker-side transport enabled after one-cycle bias calibration, budget=%u points/s",
+            commands_printf("BH_FAST_PLOT enabled after two-cycle bias/center calibration, budget=%u points/s",
                     (unsigned)(1000U / BH_FAST_PLOT_PERIOD_MS));
             bh_fast_plot_started = true;
             bh_fast_plot_elapsed_ms = 0U;
@@ -201,7 +213,7 @@ static inline void bh_fast_restore_pwm_callback(void) {
 static void bh_fast_pwm_callback(void) {
     /* Phase C is physically unused by the fixture. Preserve the existing
      * Sampled Data convention at every FOC callback: phase-C current displays
-     * INA282 OUT relative to 1.65 V, where 1 displayed A means 1 V.
+     * raw INA282 OUT relative to 1.65 V, where 1 displayed A means 1 V.
      */
     bh_sample_scope_pwm_cb();
 
@@ -230,13 +242,20 @@ static void bh_fast_pwm_callback(void) {
         return;
     }
 
-    /* bh_fast_last_vmed is the median-filtered search-winding voltage in the
-     * current bias reference. Accumulate its cycle mean for synchronous DC-bias
-     * estimation. The filter is not valid until bh_fast_have_vmed becomes true.
+    /* bh_fast_last_vmed is median-filtered search voltage in the current bias
+     * reference. Its cycle mean estimates any residual volt-second bias left
+     * after the static/current-correlated A1 compensation.
      */
     if (bh_fast_have_vmed) {
         bh_fast_cycle_vsum += bh_fast_last_vmed;
         bh_fast_cycle_vcount++;
+
+        if (bh_fast_b < bh_fast_cycle_b_min) {
+            bh_fast_cycle_b_min = bh_fast_b;
+        }
+        if (bh_fast_b > bh_fast_cycle_b_max) {
+            bh_fast_cycle_b_max = bh_fast_b;
+        }
     }
 
     bh_fast_sample_n++;
@@ -268,14 +287,36 @@ static void bh_fast_pwm_callback(void) {
             bh_fast_vhist[2] -= correction_vs;
 
             if (!bh_fast_bias_ready) {
-                /* The first cycle exists only to estimate volt-second bias.
-                 * Establish the arbitrary relative-B origin exactly once, then
-                 * expose data to the worker plotter. No later cycle resets B.
+                /* Cycle 1 only learns residual volt-second bias. Start the
+                 * relative-B integral once, in the corrected reference, and
+                 * discard this cycle's B extrema.
                  */
                 bh_fast_b = 0.0f;
                 bh_fast_last_b = 0.0f;
                 bh_fast_have_vmed = false;
                 bh_fast_bias_ready = true;
+                bh_fast_cycle_b_min = 1.0e30f;
+                bh_fast_cycle_b_max = -1.0e30f;
+            } else if (bh_fast_cycle_b_max > bh_fast_cycle_b_min) {
+                float measured_center = 0.5f *
+                        (bh_fast_cycle_b_max + bh_fast_cycle_b_min);
+
+                if (!bh_fast_center_ready) {
+                    /* Cycle 2 establishes the arbitrary integration constant.
+                     * No visible plot existed yet, so take the exact midpoint.
+                     */
+                    bh_fast_b_center = measured_center;
+                    bh_fast_center_ready = true;
+                } else {
+                    /* Once visible, only nudge the displayed origin so small
+                     * residual integrator drift cannot create plot jumps.
+                     */
+                    bh_fast_b_center += (measured_center - bh_fast_b_center) *
+                            BH_FAST_CENTER_TRACK_ALPHA;
+                }
+                bh_fast_last_b = bh_fast_b - bh_fast_b_center;
+                bh_fast_cycle_b_min = 1.0e30f;
+                bh_fast_cycle_b_max = -1.0e30f;
             }
         }
         bh_fast_cycle_vsum = 0.0f;
@@ -305,6 +346,7 @@ static void bh_init_commands(void) {
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
 #undef bh_release_locked
+#undef BH_FAST_CENTER_TRACK_ALPHA
 #undef BH_FAST_BIAS_TRACK_ALPHA
 #undef BH_FAST_PLOT_PERIOD_MS
 
