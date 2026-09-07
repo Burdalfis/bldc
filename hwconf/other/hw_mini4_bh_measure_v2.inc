@@ -15,6 +15,11 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 			(double)cfg->foc_current_kp, (double)cfg->foc_current_ki,
 			bh_sense_polarity);
 
+	// Do not carry an old feedthrough fit through a failed/incomplete R test.
+	bh_sense_pwm_model_valid = false;
+	bh_sense_pwm_offset_v = 0.0f;
+	bh_sense_pwm_current_v_per_a = 0.0f;
+
 	// The shared zero sampler keeps the bridge genuinely OFF and feeds the
 	// normal VESC motor timeout so it cannot unlock us and restart 0-A FOC PWM.
 	float sense_zero = bh_measure_sense_zero();
@@ -42,23 +47,27 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 		return false;
 	}
 
-	// Measure DC resistance after the AC capture. Sampled Data will normally have
-	// completed its post-trigger buffer by now, so these pulses no longer consume
-	// the useful scope window.
+	// Measure DC resistance after the AC capture. At settled DC excitation the
+	// ideal search-coil voltage is zero, so average A1 at the same four symmetric
+	// current points and fit the PWM/current-correlated feedthrough simultaneously.
 	commands_printf("BH_RL_STAGE R_START");
 	const float target[4] = {-1.0f, -0.5f, 0.5f, 1.0f};
 	double si = 0.0, sv = 0.0, sii = 0.0, siv = 0.0;
+	double sa1 = 0.0, sia1 = 0.0;
 	for (int n = 0; n < 4; n++) {
-		float ia = 0.0f, va = 0.0f;
-		if (!bh_measure_dc_point(target[n] * current, &ia, &va)) {
+		float ia = 0.0f, va = 0.0f, a1a = 0.0f;
+		if (!bh_measure_dc_point(target[n] * current, &ia, &va, &a1a)) {
 			bh_release_locked();
 			return false;
 		}
-		commands_printf("BH_R_POINT I=%.7f A Vab=%.7f V", (double)ia, (double)va);
+		commands_printf("BH_R_POINT I=%.7f A Vab=%.7f V A1=%.7f V",
+				(double)ia, (double)va, (double)a1a);
 		si += ia;
 		sv += va;
 		sii += (double)ia * ia;
 		siv += (double)ia * va;
+		sa1 += a1a;
+		sia1 += (double)ia * a1a;
 	}
 
 	double den = 4.0 * sii - si * si;
@@ -76,6 +85,28 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 	}
 	commands_printf("BH_RL_STAGE R_DONE Rline=%.6f mOhm Voff=%.6f V",
 			(double)(r_line * 1e3f), (double)v_offset);
+
+	/* Fit absolute A1 output as intercept + slope*I, then express the intercept
+	 * relative to the bridge-hard-off zero measured above. The resulting model
+	 * is exactly what live acquisition subtracts before applying INA gain.
+	 */
+	float a1_slope = (float)((4.0 * sia1 - si * sa1) / den);
+	float a1_intercept = (float)((sa1 - (double)a1_slope * si) / 4.0);
+	float a1_pwm_offset = a1_intercept - sense_zero;
+	bool a1_model_ok = isfinite(a1_slope) && isfinite(a1_pwm_offset) &&
+			fabsf(a1_pwm_offset) < 0.75f && fabsf(a1_slope) < 1.0f;
+	if (a1_model_ok) {
+		bh_sense_pwm_offset_v = a1_pwm_offset;
+		bh_sense_pwm_current_v_per_a = a1_slope;
+		bh_sense_pwm_model_valid = true;
+		commands_printf("BH_A1_PWM_MODEL valid V0=%+.6f mV K=%+.6f mV/A A1off=%.7f V",
+				(double)(a1_pwm_offset * 1e3f),
+				(double)(a1_slope * 1e3f), (double)sense_zero);
+	} else {
+		commands_printf("BH_A1_PWM_MODEL rejected V0=%+.6f mV K=%+.6f mV/A; live compensation disabled",
+				(double)(a1_pwm_offset * 1e3f),
+				(double)(a1_slope * 1e3f));
+	}
 
 	float tracking = 100.0f * final.i_amp / ac_current;
 	float r_ac = r_line + final.r_mag;
