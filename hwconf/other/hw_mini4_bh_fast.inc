@@ -98,12 +98,14 @@ static inline void bh_fast_abort_drive(void) {
 }
 
 /* One tracer-rate acquisition step. Geometry and INA scaling are precomputed
- * in bh_fast_reset_state(), so this hot path contains no floating-point divide.
+ * in bh_fast_reset_state(), so this hot path contains no geometry division.
  *
- * The DC R measurement optionally supplies a PWM/current feedthrough model for
- * A1. At steady DC excitation the true search-coil voltage is zero, so subtract
- * that fitted V0 + K*I term from INA OUT before converting back to search-coil
- * volts. The raw A1 Sampled Data overlay remains uncorrected for diagnostics.
+ * bh_measure_rl builds an 11-point active-PWM feedthrough LUT versus measured
+ * Vd. At settled DC excitation the true search-coil voltage is zero, so the LUT
+ * directly represents A1 contamination caused by the bridge operating point.
+ * Fast acquisition subtracts a piecewise-linear interpolation of that LUT before
+ * dividing by INA gain and integrating B. The raw A1 Sampled Data overlay stays
+ * uncorrected so the physical contamination remains visible for diagnostics.
  */
 static inline bool bh_fast_acquire_sample(void) {
 	float i_now = bh_coil_current();
@@ -128,9 +130,9 @@ static inline bool bh_fast_acquire_sample(void) {
 	float vs = bh_fast_last_good_vs;
 	if (!hard) {
 		float vout = bh_sense_out_v() - bh_fast_sense_zero;
-		if (bh_sense_pwm_model_valid) {
-			vout -= bh_sense_pwm_offset_v +
-					bh_sense_pwm_current_v_per_a * i_now;
+		if (bh_sense_pwm_lut_valid) {
+			float vd_now = mcpwm_foc_get_vd();
+			vout -= bh_sense_pwm_lut_error_v(vd_now);
 		}
 		vs = vout * bh_fast_vs_scale;
 		bh_fast_last_good_vs = vs;
@@ -265,12 +267,13 @@ static bool bh_fast_live_plot(float freq) {
 			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	if (bh_sense_pwm_model_valid) {
-		commands_printf("BH_FAST_A1_COMP enabled V0=%+.6f mV K=%+.6f mV/A",
-				(double)(bh_sense_pwm_offset_v * 1e3f),
-				(double)(bh_sense_pwm_current_v_per_a * 1e3f));
+	if (bh_sense_pwm_lut_valid) {
+		commands_printf("BH_FAST_A1_COMP LUT enabled points=%d Vd=[%+.6f,%+.6f] V",
+				BH_A1_PWM_LUT_POINTS,
+				(double)bh_sense_pwm_vd_lut[0],
+				(double)bh_sense_pwm_vd_lut[BH_A1_PWM_LUT_POINTS - 1]);
 	} else {
-		commands_printf("BH_FAST_A1_COMP disabled; run bh_measure_rl to fit PWM/current A1 feedthrough");
+		commands_printf("BH_FAST_A1_COMP disabled; run bh_measure_rl to build nonlinear Vd/A1 feedthrough LUT");
 	}
 	commands_printf("BH_FAST: /%u current reference/acquisition, two-cycle bias+B-center calibration, worker-side plot transport.",
 			(unsigned)BH_FAST_DIAG_DIV);
