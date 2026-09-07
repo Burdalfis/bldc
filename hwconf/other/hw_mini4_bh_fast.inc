@@ -1,16 +1,17 @@
 /* PWM-rate current-controlled B-H live mode.
  *
  * CPU diagnostic variant: keep only the pieces needed to generate the
- * PWM-rate triangle current reference, track measured current and preserve the
- * normal VESC fault/Stop safety path. Full INA282/H/B acquisition and plotting
- * are intentionally absent in this build so we can measure the cost of the
+ * triangle current reference, track measured current and preserve the normal
+ * VESC fault/Stop safety path. Full INA282/H/B acquisition and plotting are
+ * intentionally absent in this build so we can measure the cost of the
  * current-reference callback itself on MINI4.
  *
- * The full acquisition implementation is preserved in branch history and will
- * be restored in optimized form once the CPU bottleneck is isolated.
+ * The FOC/current PI still runs at its normal full rate. Only the extra tracer
+ * callback work is decimated.
  */
 
 #define BH_FAST_OVERCURRENT_SAMPLES       4
+#define BH_FAST_DIAG_DIV                  2U
 
 /* foc_math.h still contains the MINI4 raw-SVM hook from the old voltage-drive
  * prototype. Keep its linkage satisfied but leave it permanently disabled.
@@ -32,8 +33,11 @@ static volatile float bh_fast_last_iref = 0.0f;
 static volatile unsigned bh_fast_hard_clips = 0;
 
 static float bh_fast_fs = 30000.0f;
+static float bh_fast_update_hz = 15000.0f;
 static float bh_fast_phase = 0.0f;
 static float bh_fast_phase_step = 0.0f;
+static float bh_fast_oc_lim = 1.0f;
+static unsigned bh_fast_diag_div_count = 0U;
 static int bh_fast_cycle_n = 0;
 static int bh_fast_sample_n = 0;
 static float bh_fast_cycle_i_max = -1.0e30f;
@@ -49,24 +53,17 @@ static inline float bh_fast_triangle(float p) {
 	return 4.0f * p - 4.0f;
 }
 
-/* Update the ordinary FOC d-axis current target directly from the PWM callback.
- * Fixed A-B geometry:
+/* Update the ordinary FOC d-axis current target. Fixed A-B geometry:
  *
  *     Ia = +Iline, Ib = -Iline, Ic = 0
  *     Id = 2/sqrt(3) * Iline.
  *
- * VESC remains responsible for the current PI, SVM, deadtime, current-sample
- * placement, hardware current limits and gate timing.
+ * VESC remains responsible for the full-rate current PI, SVM, deadtime,
+ * current-sample placement, hardware current limits and gate timing.
  */
 static inline void bh_fast_set_current_ref(float i_line) {
 	float i_axis = i_line * BH_TWO_BY_SQRT3;
 	mcpwm_foc_set_openloop_phase(i_axis, BH_FOC_PHASE_DEG);
-	/* Crossing exactly through zero must not let FOC's idle-release housekeeping
-	 * drop PWM between adjacent triangle samples. A real VESC Tool Stop changes
-	 * MC_STATE_RUNNING before the next callback, which is checked by the stripped
-	 * diagnostic callback in hw_mini4_bh.h.
-	 */
-	mcpwm_foc_set_current_off_delay(0.10f);
 	bh_fast_last_iref = i_line;
 }
 
@@ -112,12 +109,15 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_cycle_i_max = -1.0e30f;
 	bh_fast_cycle_i_min = 1.0e30f;
 	bh_fast_overcurrent_count = 0;
+	bh_fast_diag_div_count = 0U;
 
 	bh_fast_fs = mc_interface_get_sampling_frequency_now();
 	if (bh_fast_fs < 1000.0f) {
 		bh_fast_fs = 30000.0f;
 	}
-	bh_fast_phase_step = freq / bh_fast_fs;
+	bh_fast_update_hz = bh_fast_fs / (float)BH_FAST_DIAG_DIV;
+	bh_fast_phase_step = freq / bh_fast_update_hz;
+	bh_fast_oc_lim = fmaxf(bh_i_pk * 1.50f, bh_i_pk + 0.75f);
 }
 
 static bool bh_fast_live_plot(float freq) {
@@ -132,14 +132,16 @@ static bool bh_fast_live_plot(float freq) {
 	}
 	bh_fast_reset_state(freq, sense_zero);
 
-	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz fs=%.1f Hz turns=%g/%g zero=%.7f V sense=%+d",
+	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz foc_fs=%.1f Hz tracer_fs=%.1f Hz div=%u turns=%g/%g zero=%.7f V sense=%+d",
 			(double)bh_i_pk, (double)freq, (double)bh_fast_fs,
+			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	commands_printf("BH_FAST CPU diagnostic: PWM-rate triangle current reference only; H/B acquisition and plot transport disabled.");
+	commands_printf("BH_FAST CPU diagnostic: tracer reference/current checks at 1/%u FOC cadence; H/B acquisition and plot transport disabled.",
+			(unsigned)BH_FAST_DIAG_DIV);
 
-	/* Enter RUNNING gently before installing the PWM callback. hw_mini4_bh.h
-	 * maps this startup-only zero command to a harmless 10 mA keeper current.
+	/* Enter RUNNING gently before installing the callback. hw_mini4_bh.h maps
+	 * this startup-only zero command to a harmless 10 mA keeper current.
 	 */
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
@@ -148,6 +150,10 @@ static bool bh_fast_live_plot(float freq) {
 		return false;
 	}
 
+	/* The old callback refreshed this on every FOC invocation. It is simply a
+	 * hold-time setting, so install it once before the diagnostic starts.
+	 */
+	mcpwm_foc_set_current_off_delay(0.10f);
 	mc_interface_set_pwm_callback(bh_fast_pwm_callback);
 	bh_fast_active = true;
 	bh_fast_set_current_ref(0.0f);
