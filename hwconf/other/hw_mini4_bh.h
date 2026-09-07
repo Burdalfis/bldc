@@ -78,20 +78,67 @@ static volatile bool bh_fast_external_stop;
 #include "hw_mini4_bh_live.inc"
 #undef timer_sleep
 
+/* The decimated acquisition include defines these with initializers below.
+ * Tentative declarations let the worker-side plot wrapper snapshot them without
+ * moving any transport work into the FOC callback.
+ */
+static volatile float bh_fast_last_h;
+static volatile float bh_fast_last_b;
+
+#define BH_FAST_PLOT_PERIOD_MS 4U
+static bool bh_fast_plot_started = false;
+static unsigned bh_fast_plot_elapsed_ms = 0U;
+
 /* Give fast-mode startup a harmless nonzero target so FOC is already RUNNING
  * before its callback takes over. Once the callback owns the current reference,
  * unlock ordinary mc_interface input so VESC Tool Stop/release can reach FOC.
+ * Reset plot state here as this startup-only path runs once per fast-live job.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
+        bh_fast_plot_started = false;
+        bh_fast_plot_elapsed_ms = 0U;
         i_line = 0.010f;
     }
     bh_apply_current(i_line);
     mc_interface_unlock();
 }
 
-/* Fast mode uses the decimated callback below for both reference generation and
- * H/B acquisition. Experiment Plot transport is still intentionally absent.
+/* The fast-live worker already sleeps for 1 ms on every loop. Wrap that sleep
+ * while hw_mini4_bh_fast.inc is expanded and use it as the plot pacer. This is
+ * intentionally lossy: if the worker is delayed we send one current snapshot,
+ * never a catch-up burst. With the normal 1 ms loop and a 4 ms period the hard
+ * transport budget is approximately 250 H/B points per second.
+ *
+ * chThdSleepMilliseconds() in this function is resolved before the temporary
+ * macro below is defined, so it remains the real ChibiOS sleep implementation.
+ */
+static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
+    if (bh_fast_active) {
+        if (!bh_fast_plot_started) {
+            commands_init_plot("H (A/m)", "B relative (T)");
+            commands_plot_add_graph("B-H fast live");
+            commands_plot_set_graph(0);
+            commands_printf("BH_FAST_PLOT worker-side transport enabled, budget=%u points/s",
+                    (unsigned)(1000U / BH_FAST_PLOT_PERIOD_MS));
+            bh_fast_plot_started = true;
+            bh_fast_plot_elapsed_ms = 0U;
+        }
+
+        bh_fast_plot_elapsed_ms += sleep_ms;
+        if (bh_fast_plot_elapsed_ms >= BH_FAST_PLOT_PERIOD_MS) {
+            bh_fast_plot_elapsed_ms = 0U;
+            float h = bh_fast_last_h;
+            float b = bh_fast_last_b;
+            commands_send_plot_points(h, b);
+        }
+    }
+
+    chThdSleepMilliseconds(sleep_ms);
+}
+
+/* Fast mode uses the decimated callback below for reference generation and H/B
+ * acquisition. Experiment Plot transport is deliberately worker-side only.
  */
 static void bh_fast_pwm_callback(void);
 
@@ -102,15 +149,16 @@ static void bh_fast_pwm_callback(void);
  */
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define mc_interface_lock() ((void)0)
+#define chThdSleepMilliseconds(ms) bh_fast_worker_plot_sleep((unsigned)(ms))
 #include "hw_mini4_bh_fast.inc"
+#undef chThdSleepMilliseconds
 #undef mc_interface_lock
 #undef bh_apply_current
 
 /* VESC's FOC/current PI continues running at its normal full cadence. This
  * tracer-specific callback runs only every BH_FAST_DIAG_DIV FOC callbacks and
- * now performs the representative INA282/current filtering plus H/B integration
- * at that same decimated rate. Plot/USB transmission remains disabled so the
- * CPU cost measured here is acquisition rather than transport.
+ * performs INA282/current filtering plus H/B integration at that same decimated
+ * rate. Plot transmission consumes only worker time through the wrapper above.
  */
 static void bh_fast_pwm_callback(void) {
     if (!bh_fast_active) {
@@ -180,5 +228,6 @@ static void bh_init_commands(void) {
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
 #undef bh_release_locked
+#undef BH_FAST_PLOT_PERIOD_MS
 
 #endif /* HW_MINI4_BH_H_ */
