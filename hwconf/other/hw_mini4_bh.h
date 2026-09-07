@@ -86,18 +86,17 @@ static volatile float bh_fast_last_h;
 static volatile float bh_fast_last_b;
 
 #define BH_FAST_PLOT_PERIOD_MS 4U
-#define BH_FAST_BIAS_TRACK_ALPHA 0.125f
-#define BH_FAST_CENTER_TRACK_ALPHA 0.125f
 static bool bh_fast_plot_started = false;
 static unsigned bh_fast_plot_elapsed_ms = 0U;
 
-/* Calibration/centering state:
- *   cycle 1: estimate residual volt-second bias; no plot
- *   cycle 2: integrate with that bias removed, measure Bmin/Bmax; no plot
- *   cycle 3+: plot B - Bcenter while gently tracking residual bias and center
+/* Frozen startup calibration state:
+ *   cycle 1: estimate one residual volt-second bias; no plot
+ *   cycle 2: integrate with that fixed bias removed and measure Bmin/Bmax; no plot
+ *   cycle 3+: plot using the fixed B center from cycle 2
  *
- * The raw B integrator is continuous after cycle 1. Bcenter is only the
- * arbitrary integration constant presented to Experiment Plot.
+ * Neither the A1 zero correction nor B center changes once plotting starts. This
+ * makes a stationary magnetic loop remain stationary instead of allowing the
+ * estimator itself to slowly reshape or reverse the apparent hysteresis.
  */
 static volatile bool bh_fast_bias_ready = false;
 static volatile bool bh_fast_center_ready = false;
@@ -137,8 +136,8 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
  * transport budget is approximately 250 H/B points per second.
  *
  * Do not initialize or send the plot until both hidden calibration cycles have
- * completed. The first visible point therefore already uses a volt-second bias
- * estimate and a centered B origin.
+ * completed. The first visible point therefore already uses the frozen
+ * volt-second bias estimate and fixed B origin.
  *
  * This helper is defined while ChibiOS's original sleep macro is still active,
  * so its final statement preprocesses to chThdSleep(MS2ST(sleep_ms)).
@@ -149,7 +148,7 @@ static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
             commands_init_plot("H (A/m)", "B relative (T)");
             commands_plot_add_graph("B-H fast live");
             commands_plot_set_graph(0);
-            commands_printf("BH_FAST_PLOT enabled after two-cycle bias/center calibration, budget=%u points/s",
+            commands_printf("BH_FAST_PLOT enabled after frozen two-cycle bias/center calibration, budget=%u points/s",
                     (unsigned)(1000U / BH_FAST_PLOT_PERIOD_MS));
             bh_fast_plot_started = true;
             bh_fast_plot_elapsed_ms = 0U;
@@ -242,19 +241,20 @@ static void bh_fast_pwm_callback(void) {
         return;
     }
 
-    /* bh_fast_last_vmed is median-filtered search voltage in the current bias
-     * reference. Its cycle mean estimates any residual volt-second bias left
-     * after the static/current-correlated A1 compensation.
+    /* Calibration work is only active during the first two cycles. Once both
+     * values are frozen, the callback stops accumulating these statistics.
      */
     if (bh_fast_have_vmed) {
-        bh_fast_cycle_vsum += bh_fast_last_vmed;
-        bh_fast_cycle_vcount++;
-
-        if (bh_fast_b < bh_fast_cycle_b_min) {
-            bh_fast_cycle_b_min = bh_fast_b;
-        }
-        if (bh_fast_b > bh_fast_cycle_b_max) {
-            bh_fast_cycle_b_max = bh_fast_b;
+        if (!bh_fast_bias_ready) {
+            bh_fast_cycle_vsum += bh_fast_last_vmed;
+            bh_fast_cycle_vcount++;
+        } else if (!bh_fast_center_ready) {
+            if (bh_fast_b < bh_fast_cycle_b_min) {
+                bh_fast_cycle_b_min = bh_fast_b;
+            }
+            if (bh_fast_b > bh_fast_cycle_b_max) {
+                bh_fast_cycle_b_max = bh_fast_b;
+            }
         }
     }
 
@@ -269,27 +269,24 @@ static void bh_fast_pwm_callback(void) {
         bh_fast_sample_n = 0;
         next_phase -= 1.0f;
 
-        if (bh_fast_cycle_vcount > 0U && fabsf(bh_fast_vs_scale) > 1.0e-9f) {
-            float mean_vs = bh_fast_cycle_vsum / (float)bh_fast_cycle_vcount;
-            float correction_vs = bh_fast_bias_ready ?
-                    mean_vs * BH_FAST_BIAS_TRACK_ALPHA : mean_vs;
+        if (!bh_fast_bias_ready) {
+            if (bh_fast_cycle_vcount > 0U && fabsf(bh_fast_vs_scale) > 1.0e-9f) {
+                float correction_vs = bh_fast_cycle_vsum /
+                        (float)bh_fast_cycle_vcount;
 
-            /* Move the INA zero reference so future samples subtract the
-             * estimated residual DC component. Transform all stored voltage
-             * history into the same new reference so the median/trapezoid
-             * filters do not see an artificial step at the cycle boundary.
-             */
-            bh_fast_sense_zero += correction_vs / bh_fast_vs_scale;
-            bh_fast_last_vmed -= correction_vs;
-            bh_fast_last_good_vs -= correction_vs;
-            bh_fast_vhist[0] -= correction_vs;
-            bh_fast_vhist[1] -= correction_vs;
-            bh_fast_vhist[2] -= correction_vs;
+                /* Freeze one residual volt-second correction. Move all stored
+                 * voltage history into the same new reference so the median and
+                 * trapezoid filters do not see an artificial cycle-boundary step.
+                 */
+                bh_fast_sense_zero += correction_vs / bh_fast_vs_scale;
+                bh_fast_last_vmed -= correction_vs;
+                bh_fast_last_good_vs -= correction_vs;
+                bh_fast_vhist[0] -= correction_vs;
+                bh_fast_vhist[1] -= correction_vs;
+                bh_fast_vhist[2] -= correction_vs;
 
-            if (!bh_fast_bias_ready) {
-                /* Cycle 1 only learns residual volt-second bias. Start the
-                 * relative-B integral once, in the corrected reference, and
-                 * discard this cycle's B extrema.
+                /* Cycle 1 is calibration only. Start the relative-B integral
+                 * once in the corrected reference, then never alter A1 zero again.
                  */
                 bh_fast_b = 0.0f;
                 bh_fast_last_b = 0.0f;
@@ -297,30 +294,25 @@ static void bh_fast_pwm_callback(void) {
                 bh_fast_bias_ready = true;
                 bh_fast_cycle_b_min = 1.0e30f;
                 bh_fast_cycle_b_max = -1.0e30f;
-            } else if (bh_fast_cycle_b_max > bh_fast_cycle_b_min) {
-                float measured_center = 0.5f *
-                        (bh_fast_cycle_b_max + bh_fast_cycle_b_min);
-
-                if (!bh_fast_center_ready) {
-                    /* Cycle 2 establishes the arbitrary integration constant.
-                     * No visible plot existed yet, so take the exact midpoint.
-                     */
-                    bh_fast_b_center = measured_center;
-                    bh_fast_center_ready = true;
-                } else {
-                    /* Once visible, only nudge the displayed origin so small
-                     * residual integrator drift cannot create plot jumps.
-                     */
-                    bh_fast_b_center += (measured_center - bh_fast_b_center) *
-                            BH_FAST_CENTER_TRACK_ALPHA;
-                }
-                bh_fast_last_b = bh_fast_b - bh_fast_b_center;
-                bh_fast_cycle_b_min = 1.0e30f;
-                bh_fast_cycle_b_max = -1.0e30f;
             }
+        } else if (!bh_fast_center_ready &&
+                bh_fast_cycle_b_max > bh_fast_cycle_b_min) {
+            /* Cycle 2 establishes the arbitrary integration constant exactly
+             * once. No visible plot exists yet, so this fixed midpoint creates
+             * no discontinuity and cannot later morph the apparent loop shape.
+             */
+            bh_fast_b_center = 0.5f *
+                    (bh_fast_cycle_b_max + bh_fast_cycle_b_min);
+            bh_fast_last_b = bh_fast_b - bh_fast_b_center;
+            bh_fast_center_ready = true;
         }
+
         bh_fast_cycle_vsum = 0.0f;
         bh_fast_cycle_vcount = 0U;
+        if (!bh_fast_center_ready) {
+            bh_fast_cycle_b_min = 1.0e30f;
+            bh_fast_cycle_b_max = -1.0e30f;
+        }
     }
     bh_fast_phase = next_phase;
 
@@ -346,8 +338,6 @@ static void bh_init_commands(void) {
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
 #undef bh_release_locked
-#undef BH_FAST_CENTER_TRACK_ALPHA
-#undef BH_FAST_BIAS_TRACK_ALPHA
 #undef BH_FAST_PLOT_PERIOD_MS
 
 #endif /* HW_MINI4_BH_H_ */
