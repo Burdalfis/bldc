@@ -143,8 +143,8 @@ static bool bh_measure_ac_search_once(float ac_current, float freq,
 	}
 
 	// The open-circuit search winding measures Ns*dPhi/dt directly. Refer that
-	// voltage to the 20-turn excitation winding using Np/Ns. Sense lead polarity
-	// is arbitrary, so choose the sign that makes inductive reactance positive;
+	// voltage to the excitation winding using Np/Ns. Sense lead polarity is
+	// arbitrary, so choose the sign that makes inductive reactance positive;
 	// use that same sign for the in-phase magnetic-loss component.
 	float r_sec = (float)((vs_s * i_s + vs_c * i_c) / zden);
 	float x_sec = (float)((vs_c * i_s - vs_s * i_c) / zden);
@@ -158,119 +158,11 @@ static bool bh_measure_ac_search_once(float ac_current, float freq,
 	return true;
 }
 
-static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float freq) {
-	const float ac_current = fminf(current, BH_RL_AC_CURRENT_A);
-	commands_printf("BH_RL_START Ir=%.4f A Il=%.4f A f=%.3f Hz",
-			(double)current, (double)ac_current, (double)freq);
-
-	const float target[4] = {-1.0f, -0.5f, 0.5f, 1.0f};
-	double si = 0.0, sv = 0.0, sii = 0.0, siv = 0.0;
-	for (int n = 0; n < 4; n++) {
-		float ia = 0.0f, va = 0.0f;
-		if (!bh_measure_dc_point(target[n] * current, &ia, &va)) {
-			bh_release_locked();
-			return false;
-		}
-		commands_printf("BH_R_POINT I=%.7f A Vab=%.7f V", (double)ia, (double)va);
-		si += ia;
-		sv += va;
-		sii += (double)ia * ia;
-		siv += (double)ia * va;
-	}
-
-	double den = 4.0 * sii - si * si;
-	if (fabs(den) < 1e-12) {
-		commands_printf("BH_RL_ABORT resistance fit is singular");
-		bh_release_locked();
-		return false;
-	}
-	float r_line = (float)((4.0 * siv - si * sv) / den);
-	float v_offset = (float)((sv - (double)r_line * si) / 4.0);
-	if (!(r_line > 0.0001f && r_line < 5.0f)) {
-		commands_printf("BH_RL_ABORT implausible Rline=%.8f ohm", (double)r_line);
-		bh_release_locked();
-		return false;
-	}
-	commands_printf("BH_RL_STAGE R_DONE Rline=%.6f mOhm Voff=%.6f V",
-			(double)(r_line * 1e3f), (double)v_offset);
-
-	bh_release_locked();
-	bh_hold_hard_off_ms(20);
-	float sense_zero = bh_measure_sense_zero();
-	if (!bh_sense_zero_ok) {
-		commands_printf("BH_RL_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
-		return false;
-	}
-
-	// First use intentionally gentle gains. Even if the current only reaches a
-	// fraction of the requested amplitude, the search winding still gives a good
-	// preliminary L because the calculation uses measured current, not command.
-	commands_printf("BH_RL_STAGE AC_PROBE A1zero=%.7f V", (double)sense_zero);
-	bh_set_measurement_gains(cfg, r_line);
-	mc_interface_set_configuration(cfg);
-	bh_hold_hard_off_ms(50);
-	bh_ac_probe_t probe;
-	if (!bh_measure_ac_search_once(ac_current, freq, sense_zero, &probe)) {
-		return false;
-	}
-	if (!(probe.l_line > 0.1e-6f && probe.l_line < 0.100f) || probe.i_amp < 0.010f) {
-		commands_printf("BH_RL_ABORT bad AC probe L=%.6f uH I=%.6f A Vsense=%.7f V",
-				(double)(probe.l_line * 1e6f), (double)probe.i_amp, (double)probe.vs_amp);
-		return false;
-	}
-	commands_printf("BH_RL_PROBE Lline=%.6f uH Iac=%.6f A Vsense=%.7f V Rmag=%.6f mOhm",
-			(double)(probe.l_line * 1e6f), (double)probe.i_amp,
-			(double)probe.vs_amp, (double)(probe.r_mag * 1e3f));
-
-	// Now tune the d-axis PI from the measured fixture itself. The physical A-B
-	// plant transforms to Rd=Rline/2 and Ld=Lline/2. Use at least 250 Hz loop
-	// bandwidth and about five times the requested test frequency, capped at
-	// 1 kHz. Kp is capped at 1 V/A so even an unexpectedly large inductance does
-	// not generate an absurd controller gain.
-	float r_d = 0.5f * r_line;
-	float l_d = 0.5f * probe.l_line;
-	float bw = fmaxf(250.0f, fminf(1000.0f, 5.0f * freq));
-	float wc = 2.0f * M_PI * bw;
-	float kp = l_d * wc;
-	float ki = r_d * wc;
-	kp = fminf(fmaxf(kp, 0.00001f), 1.0f);
-	ki = fminf(fmaxf(ki, 0.1f), 300.0f);
-	cfg->foc_motor_r = r_d;
-	cfg->foc_motor_l = l_d;
-	cfg->foc_current_kp = kp;
-	cfg->foc_current_ki = ki;
-	mc_interface_set_configuration(cfg);
-	bh_hold_hard_off_ms(50);
-	commands_printf("BH_RL_STAGE AC_TUNED Kp=%.7f Ki=%.7f BW=%.1f Hz",
-			(double)kp, (double)ki, (double)bw);
-
-	bh_ac_probe_t final;
-	if (!bh_measure_ac_search_once(ac_current, freq, sense_zero, &final)) {
-		return false;
-	}
-	if (!(final.l_line > 0.1e-6f && final.l_line < 0.100f)) {
-		commands_printf("BH_RL_ABORT implausible Lline=%.6f uH (Iac=%.5f A Vsense=%.7f V)",
-				(double)(final.l_line * 1e6f), (double)final.i_amp, (double)final.vs_amp);
-		return false;
-	}
-	if (final.i_amp < fmaxf(0.010f, ac_current * 0.25f)) {
-		commands_printf("BH_RL_ABORT tuned AC current too small: %.6f A", (double)final.i_amp);
-		return false;
-	}
-
-	float r_ac = r_line + final.r_mag;
-	bh_r_line_ohm = r_line;
-	bh_l_line_h = final.l_line;
-	bh_rl_valid = true;
-	commands_printf("BH_RL_DONE Rline=%.6f mOhm Lline=%.6f uH Rac=%.6f mOhm Rmag=%.6f mOhm Iac=%.6f A Vsense=%.7f V A1mean=%.9f V",
-			(double)(r_line * 1e3f), (double)(final.l_line * 1e6f),
-			(double)(r_ac * 1e3f), (double)(final.r_mag * 1e3f),
-			(double)final.i_amp, (double)final.vs_amp, (double)final.vs_mean);
-	commands_printf("BH_RL_FOC effective Rd=%.6f mOhm Ld=%.6f uH",
-			(double)(r_line * 500.0f), (double)(final.l_line * 500000.0f));
-	return true;
-}
-
+/* Shared preconditioning/volt-second offset helper used by the ordinary
+ * finite and live B-H capture paths. The obsolete legacy R/L worker that used
+ * to sit above this function has been removed; hw_mini4_bh_measure_v2.inc is
+ * now the only R/L implementation.
+ */
 static bool bh_precondition_and_offset(float freq, bool sine_wave, float sense_zero,
 		float *sense_mean) {
 	const float dt_target = 1.0f / BH_SAMPLE_HZ;
