@@ -79,6 +79,8 @@ static void bh_print_metrics(float freq, const bh_metrics_t *m, bool sweep);
  */
 static bool bh_fast_live_mode;
 static bool bh_fast_live_plot(float freq);
+static volatile bool bh_fast_active;
+static volatile bool bh_fast_external_stop;
 
 /* The live wrapper needs the legacy command parser/queue helpers above and
  * must be visible before worker_v2 calls bh_run_one(). Keep its 4 kHz timing
@@ -143,7 +145,7 @@ static inline float bh_fast_coil_current_median(void) {
 static unsigned bh_fast_plot_tx_decim = 0U;
 static unsigned bh_fast_plot_tx_yield = 0U;
 static inline void bh_fast_send_plot_point(float x, float y) {
-    if (bh_stop_requested) {
+    if (bh_stop_requested || bh_fast_external_stop || !bh_fast_active) {
         return;
     }
     if ((bh_fast_plot_tx_decim++ & 1U) != 0U) {
