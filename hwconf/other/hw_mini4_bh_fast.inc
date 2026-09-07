@@ -39,6 +39,10 @@ static float bh_fast_phase = 0.0f;
 static float bh_fast_phase_step = 0.0f;
 static float bh_fast_oc_lim = 1.0f;
 static float bh_fast_sense_zero = 1.65f;
+static float bh_fast_vs_scale = 0.02f;
+static float bh_fast_h_scale = 1.0f;
+static float bh_fast_b_step_scale = 0.0f;
+static int bh_fast_clip_window_limit = 15000;
 static unsigned bh_fast_diag_div_count = 0U;
 static int bh_fast_cycle_n = 0;
 static int bh_fast_sample_n = 0;
@@ -94,9 +98,8 @@ static inline void bh_fast_abort_drive(void) {
 	bh_fast_active = false;
 }
 
-/* One tracer-rate acquisition step. This deliberately performs the filtering
- * and magnetic integration work that the final live tracer needs, while doing
- * no buffering or plot/USB transmission yet.
+/* One tracer-rate acquisition step. Geometry and INA scaling are precomputed
+ * in bh_fast_reset_state(), so this hot path contains no floating-point divide.
  */
 static inline bool bh_fast_acquire_sample(void) {
 	float i_now = bh_coil_current();
@@ -113,14 +116,14 @@ static inline bool bh_fast_acquire_sample(void) {
 		bh_fast_abort_drive();
 		return false;
 	}
-	if (bh_fast_clip_window_samples >= (int)bh_fast_update_hz) {
+	if (bh_fast_clip_window_samples >= bh_fast_clip_window_limit) {
 		bh_fast_clip_window_samples = 0;
 		bh_fast_clip_window_events = 0;
 	}
 
 	float vs = bh_fast_last_good_vs;
 	if (!hard) {
-		vs = (bh_sense_out_v() - bh_fast_sense_zero) / BH_INA_GAIN;
+		vs = (bh_sense_out_v() - bh_fast_sense_zero) * bh_fast_vs_scale;
 		bh_fast_last_good_vs = vs;
 	}
 
@@ -155,12 +158,11 @@ static inline bool bh_fast_acquire_sample(void) {
 	}
 
 	if (bh_fast_have_vmed) {
-		bh_fast_b += 0.5f * (bh_fast_last_vmed + vmed) * bh_fast_dt /
-				(BH_SENSE_TURNS * bh_area_m2);
+		bh_fast_b += (bh_fast_last_vmed + vmed) * bh_fast_b_step_scale;
 	}
 	bh_fast_last_vmed = vmed;
 	bh_fast_have_vmed = true;
-	bh_fast_last_h = BH_EXC_TURNS * imed / bh_path_m;
+	bh_fast_last_h = imed * bh_fast_h_scale;
 	bh_fast_last_b = bh_fast_b;
 	return true;
 }
@@ -223,6 +225,18 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_dt = 1.0f / bh_fast_update_hz;
 	bh_fast_phase_step = freq / bh_fast_update_hz;
 	bh_fast_oc_lim = fmaxf(bh_i_pk * 1.50f, bh_i_pk + 0.75f);
+
+	/* All expensive geometry/sense divisions are startup-only. The 0.5 factor
+	 * is folded into the trapezoidal B integration scale as well.
+	 */
+	bh_fast_vs_scale = 1.0f / BH_INA_GAIN;
+	bh_fast_h_scale = BH_EXC_TURNS / bh_path_m;
+	bh_fast_b_step_scale = 0.5f * bh_fast_dt /
+			(BH_SENSE_TURNS * bh_area_m2);
+	bh_fast_clip_window_limit = (int)(bh_fast_update_hz + 0.5f);
+	if (bh_fast_clip_window_limit < 1) {
+		bh_fast_clip_window_limit = 1;
+	}
 }
 
 static bool bh_fast_live_plot(float freq) {
