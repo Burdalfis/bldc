@@ -212,11 +212,6 @@ static inline void bh_apply_current(float i_line) {
 	mc_interface_set_openloop_phase(i_line * BH_TWO_BY_SQRT3, BH_FOC_PHASE_DEG);
 }
 
-static void bh_release_locked(void) {
-	mc_interface_lock_override_once();
-	mc_interface_release_motor();
-}
-
 static void bh_common_cfg(mc_configuration *cfg, float max_line_current) {
 	cfg->motor_type = MOTOR_TYPE_FOC;
 	cfg->foc_sensor_mode = FOC_SENSOR_MODE_SENSORLESS;
@@ -235,28 +230,10 @@ static void bh_common_cfg(mc_configuration *cfg, float max_line_current) {
 	cfg->l_abs_current_max = fmaxf(cfg->l_abs_current_max, id_lim * 1.5f);
 }
 
-static void bh_set_measurement_gains(mc_configuration *cfg, float r_line_hint) {
-	// Similar spirit to VESC's detector startup gains: intentionally gentle and
-	// independent of an unknown winding L. Once R is measured, the integrator is
-	// raised enough for a useful low-frequency AC impedance measurement.
-	cfg->foc_current_kp = 0.020f;
-	float ki = 0.5f * fmaxf(r_line_hint, 0.010f) * (2.0f * M_PI * 100.0f);
-	cfg->foc_current_ki = fminf(fmaxf(ki, 1.0f), 50.0f);
-}
-
-static void bh_set_run_gains(mc_configuration *cfg) {
-	// A-B line load transforms to Rd=Rline/2 and Ld=Lline/2.
-	float r_d = 0.5f * bh_r_line_ohm;
-	float l_d = 0.5f * bh_l_line_h;
-	float wc = 2.0f * M_PI * BH_CURRENT_BW_HZ;
-	float kp = l_d * wc;
-	float ki = r_d * wc;
-
-	cfg->foc_motor_r = r_d;
-	cfg->foc_motor_l = l_d;
-	cfg->foc_current_kp = fminf(fmaxf(kp, 0.00001f), BH_KP_MAX);
-	cfg->foc_current_ki = fminf(fmaxf(ki, 0.1f), BH_KI_MAX);
-}
+/* Gain selection and ordinary release used to live here. The policy layer now
+ * keeps the user's programmed Kp/Ki and provides a hard-off release path, so
+ * the old generic implementations were dead code on the MINI4 tracer target.
+ */
 
 static bool bh_wait_and_check(float seconds) {
 	uint32_t start = timer_time_now();
