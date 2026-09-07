@@ -86,18 +86,32 @@ static volatile float bh_fast_last_h;
 static volatile float bh_fast_last_b;
 
 #define BH_FAST_PLOT_PERIOD_MS 4U
+#define BH_FAST_BIAS_TRACK_ALPHA 0.125f
 static bool bh_fast_plot_started = false;
 static unsigned bh_fast_plot_elapsed_ms = 0U;
+
+/* One complete excitation cycle is used to estimate residual search-voltage
+ * bias before plotting begins. Thereafter the previous cycle's residual mean
+ * gently trims the INA zero reference for the next cycle. B itself is never
+ * reset after that initial calibration cycle, so plotted loops stay continuous.
+ */
+static volatile bool bh_fast_bias_ready = false;
+static float bh_fast_cycle_vsum = 0.0f;
+static unsigned bh_fast_cycle_vcount = 0U;
 
 /* Give fast-mode startup a harmless nonzero target so FOC is already RUNNING
  * before its callback takes over. Once the callback owns the current reference,
  * unlock ordinary mc_interface input so VESC Tool Stop/release can reach FOC.
- * Reset plot state here as this startup-only path runs once per fast-live job.
+ * Reset plot/bias state here as this startup-only path runs once per fast-live
+ * job, before the PWM callback is installed.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
         bh_fast_plot_started = false;
         bh_fast_plot_elapsed_ms = 0U;
+        bh_fast_bias_ready = false;
+        bh_fast_cycle_vsum = 0.0f;
+        bh_fast_cycle_vcount = 0U;
         i_line = 0.010f;
     }
     bh_apply_current(i_line);
@@ -110,16 +124,20 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
  * never a catch-up burst. With the normal 1 ms loop and a 4 ms period the hard
  * transport budget is approximately 250 H/B points per second.
  *
+ * Do not initialize or send the plot until the first full excitation cycle has
+ * established a residual search-voltage bias. This keeps the one intentional
+ * startup B-zero calibration out of the visible plot history.
+ *
  * This helper is defined while ChibiOS's original sleep macro is still active,
  * so its final statement preprocesses to chThdSleep(MS2ST(sleep_ms)).
  */
 static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
-    if (bh_fast_active) {
+    if (bh_fast_active && bh_fast_bias_ready) {
         if (!bh_fast_plot_started) {
             commands_init_plot("H (A/m)", "B relative (T)");
             commands_plot_add_graph("B-H fast live");
             commands_plot_set_graph(0);
-            commands_printf("BH_FAST_PLOT worker-side transport enabled, budget=%u points/s",
+            commands_printf("BH_FAST_PLOT worker-side transport enabled after one-cycle bias calibration, budget=%u points/s",
                     (unsigned)(1000U / BH_FAST_PLOT_PERIOD_MS));
             bh_fast_plot_started = true;
             bh_fast_plot_elapsed_ms = 0U;
@@ -137,10 +155,23 @@ static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
     chThdSleepMilliseconds(sleep_ms);
 }
 
-/* Fast mode uses the decimated callback below for reference generation and H/B
- * acquisition. Experiment Plot transport is deliberately worker-side only.
+/* Fast mode temporarily owns VESC's single global PWM callback. Multiplex the
+ * ordinary phase-C Sampled Data overlay inside bh_fast_pwm_callback(), then
+ * restore the standalone overlay when fast mode exits instead of clearing the
+ * callback to NULL.
  */
 static void bh_fast_pwm_callback(void);
+static void bh_sample_scope_pwm_cb(void);
+static inline void bh_fast_install_pwm_callback(void) {
+    mc_interface_set_pwm_callback(bh_fast_pwm_callback);
+}
+static inline void bh_fast_restore_pwm_callback(void) {
+    mc_interface_set_pwm_callback(bh_sample_scope_pwm_cb);
+}
+#define BH_FAST_CB_DISPATCH_bh_fast_pwm_callback() bh_fast_install_pwm_callback()
+#define BH_FAST_CB_DISPATCH_0() bh_fast_restore_pwm_callback()
+#define BH_FAST_CB_DISPATCH_I(x) BH_FAST_CB_DISPATCH_##x()
+#define BH_FAST_CB_DISPATCH(x) BH_FAST_CB_DISPATCH_I(x)
 
 /* The worker locks normal motor input while configuring the fixture. Fast mode
  * deliberately unlocks once its callback owns the reference so VESC Tool Stop
@@ -149,20 +180,31 @@ static void bh_fast_pwm_callback(void);
  */
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define mc_interface_lock() ((void)0)
+#define mc_interface_set_pwm_callback(p_func) BH_FAST_CB_DISPATCH(p_func)
 #undef chThdSleepMilliseconds
 #define chThdSleepMilliseconds(ms) bh_fast_worker_plot_sleep((unsigned)(ms))
 #include "hw_mini4_bh_fast.inc"
 #undef chThdSleepMilliseconds
 #define chThdSleepMilliseconds(msec) chThdSleep(MS2ST(msec))
+#undef mc_interface_set_pwm_callback
 #undef mc_interface_lock
 #undef bh_apply_current
+#undef BH_FAST_CB_DISPATCH
+#undef BH_FAST_CB_DISPATCH_I
+#undef BH_FAST_CB_DISPATCH_0
+#undef BH_FAST_CB_DISPATCH_bh_fast_pwm_callback
 
-/* VESC's FOC/current PI continues running at its normal full cadence. This
- * tracer-specific callback runs only every BH_FAST_DIAG_DIV FOC callbacks and
- * performs INA282/current filtering plus H/B integration at that same decimated
- * rate. Plot transmission consumes only worker time through the wrapper above.
+/* VESC's FOC/current PI continues running at its normal full cadence. The A1
+ * Sampled Data overlay also stays full-rate. Only the tracer reference/H-B
+ * acquisition work is decimated by BH_FAST_DIAG_DIV.
  */
 static void bh_fast_pwm_callback(void) {
+    /* Phase C is physically unused by the fixture. Preserve the existing
+     * Sampled Data convention at every FOC callback: phase-C current displays
+     * INA282 OUT relative to 1.65 V, where 1 displayed A means 1 V.
+     */
+    bh_sample_scope_pwm_cb();
+
     if (!bh_fast_active) {
         return;
     }
@@ -188,6 +230,15 @@ static void bh_fast_pwm_callback(void) {
         return;
     }
 
+    /* bh_fast_last_vmed is the median-filtered search-winding voltage in the
+     * current bias reference. Accumulate its cycle mean for synchronous DC-bias
+     * estimation. The filter is not valid until bh_fast_have_vmed becomes true.
+     */
+    if (bh_fast_have_vmed) {
+        bh_fast_cycle_vsum += bh_fast_last_vmed;
+        bh_fast_cycle_vcount++;
+    }
+
     bh_fast_sample_n++;
     float next_phase = bh_fast_phase + bh_fast_phase_step;
     if (next_phase >= 1.0f) {
@@ -199,12 +250,36 @@ static void bh_fast_pwm_callback(void) {
         bh_fast_sample_n = 0;
         next_phase -= 1.0f;
 
-        /* B is intentionally relative per cycle in this diagnostic. Keep the
-         * median histories warm, but restart trapezoidal integration cleanly at
-         * the cycle boundary to prevent accumulated offset drift.
-         */
-        bh_fast_b = 0.0f;
-        bh_fast_have_vmed = false;
+        if (bh_fast_cycle_vcount > 0U && fabsf(bh_fast_vs_scale) > 1.0e-9f) {
+            float mean_vs = bh_fast_cycle_vsum / (float)bh_fast_cycle_vcount;
+            float correction_vs = bh_fast_bias_ready ?
+                    mean_vs * BH_FAST_BIAS_TRACK_ALPHA : mean_vs;
+
+            /* Move the INA zero reference so future samples subtract the
+             * estimated residual DC component. Transform all stored voltage
+             * history into the same new reference so the median/trapezoid
+             * filters do not see an artificial step at the cycle boundary.
+             */
+            bh_fast_sense_zero += correction_vs / bh_fast_vs_scale;
+            bh_fast_last_vmed -= correction_vs;
+            bh_fast_last_good_vs -= correction_vs;
+            bh_fast_vhist[0] -= correction_vs;
+            bh_fast_vhist[1] -= correction_vs;
+            bh_fast_vhist[2] -= correction_vs;
+
+            if (!bh_fast_bias_ready) {
+                /* The first cycle exists only to estimate volt-second bias.
+                 * Establish the arbitrary relative-B origin exactly once, then
+                 * expose data to the worker plotter. No later cycle resets B.
+                 */
+                bh_fast_b = 0.0f;
+                bh_fast_last_b = 0.0f;
+                bh_fast_have_vmed = false;
+                bh_fast_bias_ready = true;
+            }
+        }
+        bh_fast_cycle_vsum = 0.0f;
+        bh_fast_cycle_vcount = 0U;
     }
     bh_fast_phase = next_phase;
 
@@ -230,6 +305,7 @@ static void bh_init_commands(void) {
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
 #undef bh_release_locked
+#undef BH_FAST_BIAS_TRACK_ALPHA
 #undef BH_FAST_PLOT_PERIOD_MS
 
 #endif /* HW_MINI4_BH_H_ */
