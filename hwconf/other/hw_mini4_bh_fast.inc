@@ -1,10 +1,9 @@
 /* PWM-rate current-controlled B-H live mode.
  *
- * CPU diagnostic variant: VESC's FOC/current PI continues at full rate while
- * the extra tracer work runs at a decimated cadence. INA282/current acquisition,
- * median impulse rejection, H calculation and B integration are restored here;
- * Experiment Plot transport remains disabled so acquisition cost can be measured
- * independently from USB/plot cost.
+ * VESC's FOC/current PI continues at full rate while the extra tracer work runs
+ * at a decimated cadence. INA282/current acquisition, median impulse rejection,
+ * H calculation and B integration run at that tracer cadence; Experiment Plot
+ * transport is paced from the worker thread by hw_mini4_bh.h.
  */
 
 #define BH_FAST_OVERCURRENT_SAMPLES       4
@@ -50,8 +49,8 @@ static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 
-/* Decimated acquisition/filter state. No cycle buffers are allocated in this
- * diagnostic build because MINI4's RAM4 region has almost no spare capacity.
+/* Decimated acquisition/filter state. No cycle buffers are allocated because
+ * MINI4's RAM4 region has almost no spare capacity.
  */
 static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
 static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
@@ -100,6 +99,11 @@ static inline void bh_fast_abort_drive(void) {
 
 /* One tracer-rate acquisition step. Geometry and INA scaling are precomputed
  * in bh_fast_reset_state(), so this hot path contains no floating-point divide.
+ *
+ * The DC R measurement optionally supplies a PWM/current feedthrough model for
+ * A1. At steady DC excitation the true search-coil voltage is zero, so subtract
+ * that fitted V0 + K*I term from INA OUT before converting back to search-coil
+ * volts. The raw A1 Sampled Data overlay remains uncorrected for diagnostics.
  */
 static inline bool bh_fast_acquire_sample(void) {
 	float i_now = bh_coil_current();
@@ -123,7 +127,12 @@ static inline bool bh_fast_acquire_sample(void) {
 
 	float vs = bh_fast_last_good_vs;
 	if (!hard) {
-		vs = (bh_sense_out_v() - bh_fast_sense_zero) * bh_fast_vs_scale;
+		float vout = bh_sense_out_v() - bh_fast_sense_zero;
+		if (bh_sense_pwm_model_valid) {
+			vout -= bh_sense_pwm_offset_v +
+					bh_sense_pwm_current_v_per_a * i_now;
+		}
+		vs = vout * bh_fast_vs_scale;
 		bh_fast_last_good_vs = vs;
 	}
 
@@ -163,7 +172,7 @@ static inline bool bh_fast_acquire_sample(void) {
 	bh_fast_last_vmed = vmed;
 	bh_fast_have_vmed = true;
 	bh_fast_last_h = imed * bh_fast_h_scale;
-	bh_fast_last_b = bh_fast_b;
+	bh_fast_last_b = bh_fast_b - bh_fast_b_center;
 	return true;
 }
 
@@ -256,7 +265,14 @@ static bool bh_fast_live_plot(float freq) {
 			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	commands_printf("BH_FAST CPU diagnostic: /%u current reference plus INA282/current median, H and B integration; plot transport disabled.",
+	if (bh_sense_pwm_model_valid) {
+		commands_printf("BH_FAST_A1_COMP enabled V0=%+.6f mV K=%+.6f mV/A",
+				(double)(bh_sense_pwm_offset_v * 1e3f),
+				(double)(bh_sense_pwm_current_v_per_a * 1e3f));
+	} else {
+		commands_printf("BH_FAST_A1_COMP disabled; run bh_measure_rl to fit PWM/current A1 feedthrough");
+	}
+	commands_printf("BH_FAST: /%u current reference/acquisition, two-cycle bias+B-center calibration, worker-side plot transport.",
 			(unsigned)BH_FAST_DIAG_DIV);
 
 	/* Enter RUNNING gently before installing the callback. hw_mini4_bh.h maps
