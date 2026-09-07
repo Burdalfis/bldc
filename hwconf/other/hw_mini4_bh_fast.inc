@@ -1,16 +1,14 @@
 /* PWM-rate current-controlled B-H live mode.
  *
- * CPU diagnostic variant: keep only the pieces needed to generate the
- * triangle current reference, track measured current and preserve the normal
- * VESC fault/Stop safety path. Full INA282/H/B acquisition and plotting are
- * intentionally absent in this build so we can measure the cost of the
- * current-reference callback itself on MINI4.
- *
- * The FOC/current PI still runs at its normal full rate. Only the extra tracer
- * callback work is decimated.
+ * CPU diagnostic variant: VESC's FOC/current PI continues at full rate while
+ * the extra tracer work runs at a decimated cadence. INA282/current acquisition,
+ * median impulse rejection, H calculation and B integration are restored here;
+ * Experiment Plot transport remains disabled so acquisition cost can be measured
+ * independently from USB/plot cost.
  */
 
 #define BH_FAST_OVERCURRENT_SAMPLES       4
+#define BH_FAST_HARD_CLIPS_PER_SEC        10
 #define BH_FAST_DIAG_DIV                  2U
 
 /* foc_math.h still contains the MINI4 raw-SVM hook from the old voltage-drive
@@ -30,19 +28,36 @@ static volatile bool bh_fast_overcurrent_abort = false;
 static volatile float bh_fast_last_amp = 0.0f;
 static volatile float bh_fast_last_center = 0.0f;
 static volatile float bh_fast_last_iref = 0.0f;
+static volatile float bh_fast_last_h = 0.0f;
+static volatile float bh_fast_last_b = 0.0f;
 static volatile unsigned bh_fast_hard_clips = 0;
 
 static float bh_fast_fs = 30000.0f;
 static float bh_fast_update_hz = 15000.0f;
+static float bh_fast_dt = 1.0f / 15000.0f;
 static float bh_fast_phase = 0.0f;
 static float bh_fast_phase_step = 0.0f;
 static float bh_fast_oc_lim = 1.0f;
+static float bh_fast_sense_zero = 1.65f;
 static unsigned bh_fast_diag_div_count = 0U;
 static int bh_fast_cycle_n = 0;
 static int bh_fast_sample_n = 0;
 static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
+
+/* Decimated acquisition/filter state. No cycle buffers are allocated in this
+ * diagnostic build because MINI4's RAM4 region has almost no spare capacity.
+ */
+static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
+static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
+static int bh_fast_hist_n = 0;
+static float bh_fast_b = 0.0f;
+static float bh_fast_last_vmed = 0.0f;
+static bool bh_fast_have_vmed = false;
+static float bh_fast_last_good_vs = 0.0f;
+static int bh_fast_clip_window_samples = 0;
+static int bh_fast_clip_window_events = 0;
 
 static inline float bh_fast_triangle(float p) {
 	if (p < 0.25f) {
@@ -51,6 +66,13 @@ static inline float bh_fast_triangle(float p) {
 		return 2.0f - 4.0f * p;
 	}
 	return 4.0f * p - 4.0f;
+}
+
+static inline float bh_fast_median3(float a, float b, float c) {
+	if (a > b) { float t = a; a = b; b = t; }
+	if (b > c) { float t = b; b = c; c = t; }
+	if (a > b) { float t = a; a = b; b = t; }
+	return b;
 }
 
 /* Update the ordinary FOC d-axis current target. Fixed A-B geometry:
@@ -72,6 +94,77 @@ static inline void bh_fast_abort_drive(void) {
 	bh_fast_active = false;
 }
 
+/* One tracer-rate acquisition step. This deliberately performs the filtering
+ * and magnetic integration work that the final live tracer needs, while doing
+ * no buffering or plot/USB transmission yet.
+ */
+static inline bool bh_fast_acquire_sample(void) {
+	float i_now = bh_coil_current();
+	uint16_t raw = ADC_Value[ADC_IND_EXT];
+	bool hard = bh_adc_sample_hard_rail(raw);
+
+	bh_fast_clip_window_samples++;
+	if (hard) {
+		bh_fast_hard_clips++;
+		bh_fast_clip_window_events++;
+	}
+	if (bh_fast_clip_window_events > BH_FAST_HARD_CLIPS_PER_SEC) {
+		bh_fast_clip_abort = true;
+		bh_fast_abort_drive();
+		return false;
+	}
+	if (bh_fast_clip_window_samples >= (int)bh_fast_update_hz) {
+		bh_fast_clip_window_samples = 0;
+		bh_fast_clip_window_events = 0;
+	}
+
+	float vs = bh_fast_last_good_vs;
+	if (!hard) {
+		vs = (bh_sense_out_v() - bh_fast_sense_zero) / BH_INA_GAIN;
+		bh_fast_last_good_vs = vs;
+	}
+
+	bh_fast_vhist[0] = bh_fast_vhist[1];
+	bh_fast_vhist[1] = bh_fast_vhist[2];
+	bh_fast_vhist[2] = vs;
+	bh_fast_ihist[0] = bh_fast_ihist[1];
+	bh_fast_ihist[1] = bh_fast_ihist[2];
+	bh_fast_ihist[2] = i_now;
+	if (bh_fast_hist_n < 3) {
+		bh_fast_hist_n++;
+		return true;
+	}
+
+	float imed = bh_fast_median3(
+			bh_fast_ihist[0], bh_fast_ihist[1], bh_fast_ihist[2]);
+	float vmed = bh_fast_median3(
+			bh_fast_vhist[0], bh_fast_vhist[1], bh_fast_vhist[2]);
+
+	if (imed > bh_fast_cycle_i_max) bh_fast_cycle_i_max = imed;
+	if (imed < bh_fast_cycle_i_min) bh_fast_cycle_i_min = imed;
+
+	if (fabsf(imed) > bh_fast_oc_lim) {
+		bh_fast_overcurrent_count++;
+		if (bh_fast_overcurrent_count >= BH_FAST_OVERCURRENT_SAMPLES) {
+			bh_fast_overcurrent_abort = true;
+			bh_fast_abort_drive();
+			return false;
+		}
+	} else {
+		bh_fast_overcurrent_count = 0;
+	}
+
+	if (bh_fast_have_vmed) {
+		bh_fast_b += 0.5f * (bh_fast_last_vmed + vmed) * bh_fast_dt /
+				(BH_SENSE_TURNS * bh_area_m2);
+	}
+	bh_fast_last_vmed = vmed;
+	bh_fast_have_vmed = true;
+	bh_fast_last_h = BH_EXC_TURNS * imed / bh_path_m;
+	bh_fast_last_b = bh_fast_b;
+	return true;
+}
+
 static bool bh_fast_install_tight_current_limits(void) {
 	mc_configuration *cfg = mempools_alloc_mcconf();
 	if (!cfg) {
@@ -91,7 +184,6 @@ static bool bh_fast_install_tight_current_limits(void) {
 }
 
 static void bh_fast_reset_state(float freq, float sense_zero) {
-	(void)sense_zero;
 	bh_foc_svm_override_active = false;
 	bh_foc_svm_override_alpha = 0.0f;
 	bh_foc_svm_override_beta = 0.0f;
@@ -102,6 +194,8 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_last_amp = 0.0f;
 	bh_fast_last_center = 0.0f;
 	bh_fast_last_iref = 0.0f;
+	bh_fast_last_h = 0.0f;
+	bh_fast_last_b = 0.0f;
 	bh_fast_hard_clips = 0;
 	bh_fast_phase = 0.0f;
 	bh_fast_cycle_n = 0;
@@ -110,12 +204,23 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_cycle_i_min = 1.0e30f;
 	bh_fast_overcurrent_count = 0;
 	bh_fast_diag_div_count = 0U;
+	bh_fast_sense_zero = sense_zero;
+	bh_fast_hist_n = 0;
+	bh_fast_b = 0.0f;
+	bh_fast_last_vmed = 0.0f;
+	bh_fast_have_vmed = false;
+	bh_fast_last_good_vs = 0.0f;
+	bh_fast_clip_window_samples = 0;
+	bh_fast_clip_window_events = 0;
+	memset(bh_fast_vhist, 0, sizeof(bh_fast_vhist));
+	memset(bh_fast_ihist, 0, sizeof(bh_fast_ihist));
 
 	bh_fast_fs = mc_interface_get_sampling_frequency_now();
 	if (bh_fast_fs < 1000.0f) {
 		bh_fast_fs = 30000.0f;
 	}
 	bh_fast_update_hz = bh_fast_fs / (float)BH_FAST_DIAG_DIV;
+	bh_fast_dt = 1.0f / bh_fast_update_hz;
 	bh_fast_phase_step = freq / bh_fast_update_hz;
 	bh_fast_oc_lim = fmaxf(bh_i_pk * 1.50f, bh_i_pk + 0.75f);
 }
@@ -137,7 +242,7 @@ static bool bh_fast_live_plot(float freq) {
 			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	commands_printf("BH_FAST CPU diagnostic: tracer reference/current checks at 1/%u FOC cadence; H/B acquisition and plot transport disabled.",
+	commands_printf("BH_FAST CPU diagnostic: /%u current reference plus INA282/current median, H and B integration; plot transport disabled.",
 			(unsigned)BH_FAST_DIAG_DIV);
 
 	/* Enter RUNNING gently before installing the callback. hw_mini4_bh.h maps
@@ -150,9 +255,6 @@ static bool bh_fast_live_plot(float freq) {
 		return false;
 	}
 
-	/* The old callback refreshed this on every FOC invocation. It is simply a
-	 * hold-time setting, so install it once before the diagnostic starts.
-	 */
 	mcpwm_foc_set_current_off_delay(0.10f);
 	mc_interface_set_pwm_callback(bh_fast_pwm_callback);
 	bh_fast_active = true;
@@ -174,9 +276,10 @@ static bool bh_fast_live_plot(float freq) {
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
 			float track = bh_i_pk > 0.001f ? 100.0f * bh_fast_last_amp / bh_i_pk : 0.0f;
-			commands_printf("BH_FAST_STAT Iamp=%.5f A track=%.2f%% Icenter=%+.5f A Iref=%+.5f A Id=%+.5f A Vd=%+.5f V duty=%+.5f clips=%u",
+			commands_printf("BH_FAST_STAT Iamp=%.5f A track=%.2f%% Icenter=%+.5f A Iref=%+.5f A H=%+.2f A/m B=%+.7f T Id=%+.5f A Vd=%+.5f V duty=%+.5f clips=%u",
 					(double)bh_fast_last_amp, (double)track,
 					(double)bh_fast_last_center, (double)bh_fast_last_iref,
+					(double)bh_fast_last_h, (double)bh_fast_last_b,
 					(double)mcpwm_foc_get_id(), (double)mcpwm_foc_get_vd(),
 					(double)mc_interface_get_duty_cycle_now(),
 					(unsigned)bh_fast_hard_clips);
@@ -190,6 +293,10 @@ static bool bh_fast_live_plot(float freq) {
 	bh_release_locked();
 	bh_foc_svm_override_active = false;
 
+	if (bh_fast_clip_abort) {
+		commands_printf("BH_FAST_DONE ABORT sustained A1 clipping (>10 hard-rail samples/s)");
+		return false;
+	}
 	if (bh_fast_overcurrent_abort) {
 		commands_printf("BH_FAST_DONE ABORT measured current exceeded sanity limit");
 		return false;
@@ -240,7 +347,7 @@ static void terminal_bh_live_fast(int argc, const char **argv) {
 static void bh_fast_init_commands(void) {
 	terminal_register_command_callback(
 			"bh_live_fast",
-			"PWM-rate triangle-current B-H live plot through normal FOC current control.",
+			"Decimated triangle-current B-H live diagnostic through normal FOC current control.",
 			"<Ipk_A> <freq_Hz> <path_mm> <area_mm2>",
 			terminal_bh_live_fast);
 }
