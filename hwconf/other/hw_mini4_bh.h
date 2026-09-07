@@ -130,34 +130,19 @@ static inline float bh_fast_coil_current_median(void) {
     return b;
 }
 
-/* Use the same ordinary asynchronous COMM_PLOT_DATA path as VESC's HFI plot.
- * The failed experiment used commands_send_packet_last_blocking(), which tied
- * every point to the terminal-command reply transport and could congest command
- * handling badly enough that Stop itself was delayed.
+/* CPU-load diagnostic: intentionally suppress every fast-mode Experiment Plot
+ * data packet while leaving the PWM-rate current generator, A1/current
+ * acquisition, B integration, cycle buffering, closure/centering, protections
+ * and once-per-second terminal statistics unchanged. This isolates the cost of
+ * COMM_PLOT_DATA transport from the actual magnetic measurement path.
  *
- * Keep every second display point and emit four packets per millisecond. That
- * caps the stream near 4000 plot packets/s -- still several times the stock HFI
- * plot rate, but with a real scheduler sleep that lets SampleSender, USB and
- * command handling run between tiny bursts. PWM-rate H/B acquisition continues
- * independently in the FOC callback. If Stop arrives mid-cycle, the remaining
- * buffered points are discarded rather than flushed after the drive stops.
+ * The plot is still initialized by bh_fast_live_plot(), and completed cycles
+ * are still drained/processed by bh_fast_plot_ready_cycle(); only the final
+ * commands_send_plot_points() transport operation is turned into a no-op.
  */
-static unsigned bh_fast_plot_tx_decim = 0U;
-static unsigned bh_fast_plot_tx_burst = 0U;
 static inline void bh_fast_send_plot_point(float x, float y) {
-    if (bh_stop_requested || bh_fast_external_stop || !bh_fast_active) {
-        return;
-    }
-    if ((bh_fast_plot_tx_decim++ & 1U) != 0U) {
-        return;
-    }
-
-    commands_send_plot_points(x, y);
-    bh_fast_plot_tx_burst++;
-    if (bh_fast_plot_tx_burst >= 4U) {
-        bh_fast_plot_tx_burst = 0U;
-        chThdSleepMilliseconds(1);
-    }
+    (void)x;
+    (void)y;
 }
 
 /* Run the extra B-H generator/acquisition callback at the full FOC callback
