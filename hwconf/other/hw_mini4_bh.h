@@ -135,15 +135,15 @@ static inline float bh_fast_coil_current_median(void) {
  * every point to the terminal-command reply transport and could congest command
  * handling badly enough that Stop itself was delayed.
  *
- * We keep every second display point (up to about 4k packets/s at the current
- * 20 displayed-loop/s cap), but never sleep inside a completed-cycle dump.
- * Instead yield after four packets. That lets SampleSender and other equal-
- * priority housekeeping run while USB drains, without stalling PWM-rate H/B
- * acquisition. If Stop arrives mid-cycle, the remaining buffered points are
- * simply discarded rather than flushed after the drive has been stopped.
+ * Keep every second display point and emit four packets per millisecond. That
+ * caps the stream near 4000 plot packets/s -- still several times the stock HFI
+ * plot rate, but with a real scheduler sleep that lets SampleSender, USB and
+ * command handling run between tiny bursts. PWM-rate H/B acquisition continues
+ * independently in the FOC callback. If Stop arrives mid-cycle, the remaining
+ * buffered points are discarded rather than flushed after the drive stops.
  */
 static unsigned bh_fast_plot_tx_decim = 0U;
-static unsigned bh_fast_plot_tx_yield = 0U;
+static unsigned bh_fast_plot_tx_burst = 0U;
 static inline void bh_fast_send_plot_point(float x, float y) {
     if (bh_stop_requested || bh_fast_external_stop || !bh_fast_active) {
         return;
@@ -153,10 +153,10 @@ static inline void bh_fast_send_plot_point(float x, float y) {
     }
 
     commands_send_plot_points(x, y);
-    bh_fast_plot_tx_yield++;
-    if (bh_fast_plot_tx_yield >= 4U) {
-        bh_fast_plot_tx_yield = 0U;
-        chThdYield();
+    bh_fast_plot_tx_burst++;
+    if (bh_fast_plot_tx_burst >= 4U) {
+        bh_fast_plot_tx_burst = 0U;
+        chThdSleepMilliseconds(1);
     }
 }
 
