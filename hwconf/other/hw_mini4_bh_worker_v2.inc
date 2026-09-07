@@ -17,6 +17,16 @@
 static THD_FUNCTION(bh_thread, arg) {
 	(void)arg;
 	chRegSetThreadName("MINI4 B-H tracer");
+	/* The legacy queue creates this worker at NORMALPRIO-1 so ordinary motor
+	 * telemetry cannot be starved by the old busy measurement loops. Fast live
+	 * mode is different: its PWM-rate acquisition runs in the FOC callback and
+	 * this thread only drains completed cycles to USB/Experiment Plot. Leaving it
+	 * below all NORMALPRIO FOC/USB housekeeping means it can remain READY without
+	 * ever getting scheduled while the motor is active. Promote ourselves to the
+	 * normal housekeeping priority; the live loop and plot sender sleep/yield
+	 * frequently, so this does not preempt the time-critical FOC ISR.
+	 */
+	chThdSetPriority(NORMALPRIO);
 
 	for (;;) {
 		if (bh_job == BH_JOB_NONE) {
