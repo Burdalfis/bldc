@@ -154,13 +154,24 @@ static void bh_sample_scope_pwm_cb(void);
 static void bh_fast_pwm_callback_mux(void) {
     bh_fast_pwm_callback();
 }
-static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
-    if (p_func) {
-        mc_interface_set_pwm_callback(bh_fast_pwm_callback_mux);
-    } else {
-        mc_interface_set_pwm_callback(bh_sample_scope_pwm_cb);
-    }
+
+/* hw_mini4_bh_fast.inc only installs its callback with either the callback
+ * symbol itself or literal 0. Dispatch those tokens at preprocessing time
+ * rather than passing the old full callback pointer through a helper. That
+ * leaves bh_fast_pwm_callback_core() completely unreferenced in this CPU
+ * diagnostic build, so --gc-sections can discard the large H/B acquisition
+ * callback instead of retaining it beside the stripped callback below.
+ */
+static inline void bh_fast_set_pwm_callback_on(void) {
+    mc_interface_set_pwm_callback(bh_fast_pwm_callback_mux);
 }
+static inline void bh_fast_set_pwm_callback_off(void) {
+    mc_interface_set_pwm_callback(bh_sample_scope_pwm_cb);
+}
+#define BH_FAST_CB_DISPATCH_bh_fast_pwm_callback_core() bh_fast_set_pwm_callback_on()
+#define BH_FAST_CB_DISPATCH_0() bh_fast_set_pwm_callback_off()
+#define BH_FAST_CB_DISPATCH_I(x) BH_FAST_CB_DISPATCH_##x()
+#define BH_FAST_CB_DISPATCH(x) BH_FAST_CB_DISPATCH_I(x)
 
 /* The worker locks normal motor input while configuring the fixture. Fast mode
  * deliberately unlocks once its PWM callback owns the reference so VESC Tool
@@ -172,7 +183,7 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
 #define bh_coil_current() bh_fast_coil_current_median()
 #define commands_send_plot_points(x, y) bh_fast_send_plot_point((x), (y))
 #define mc_interface_get_sampling_frequency_now() bh_fast_effective_sample_hz()
-#define mc_interface_set_pwm_callback(p_func) bh_fast_set_pwm_callback_mux(p_func)
+#define mc_interface_set_pwm_callback(p_func) BH_FAST_CB_DISPATCH(p_func)
 #define mc_interface_lock() ((void)0)
 #define bh_fast_pwm_callback bh_fast_pwm_callback_core
 #include "hw_mini4_bh_fast.inc"
@@ -183,10 +194,14 @@ static inline void bh_fast_set_pwm_callback_mux(void (*p_func)(void)) {
 #undef commands_send_plot_points
 #undef bh_coil_current
 #undef bh_apply_current
+#undef BH_FAST_CB_DISPATCH
+#undef BH_FAST_CB_DISPATCH_I
+#undef BH_FAST_CB_DISPATCH_0
+#undef BH_FAST_CB_DISPATCH_bh_fast_pwm_callback_core
 
 /* CPU-load diagnostic callback: keep only the PWM-rate triangle reference and
  * measured-current safety/tracking. The original bh_fast_pwm_callback_core()
- * remains compiled above but is intentionally not called in this build.
+ * remains in source above but is intentionally unreferenced and link-GC'd.
  */
 static void bh_fast_pwm_callback(void) {
     if (!bh_fast_active) {
