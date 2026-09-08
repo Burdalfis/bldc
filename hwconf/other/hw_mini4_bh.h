@@ -90,6 +90,9 @@ static float bh_fast_b_step_scale;
 
 #define BH_FAST_PLOT_PERIOD_MS 4U
 #define BH_FAST_B_CENTER_CYCLES 16U
+#define BH_FAST_A1_BIAS_CYCLES 16U
+#define BH_FAST_H_PHASE_BINS 64U
+#define BH_FAST_H_PHASE_ALPHA 0.125f
 
 /* External differential RC network de-embedding.
  *
