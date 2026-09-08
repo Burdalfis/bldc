@@ -118,19 +118,6 @@ static float bh_r_line_ohm = 0.0f;
 static float bh_l_line_h = 0.0f;
 static bool bh_rl_valid = false;
 
-/* PWM/current-correlated A1 feedthrough model measured during the DC resistance
- * pulses. At steady DC excitation the ideal search-coil voltage is zero, so
- * any A1 shift relative to the hard-off zero is fixture/controller feedthrough:
- *
- *   Vout_pwm - Vout_off = bh_sense_pwm_offset_v
- *                       + bh_sense_pwm_current_v_per_a * Iline
- *
- * Fast B-H acquisition subtracts this model before dividing by INA gain.
- */
-static float bh_sense_pwm_offset_v = 0.0f;
-static float bh_sense_pwm_current_v_per_a = 0.0f;
-static bool bh_sense_pwm_model_valid = false;
-
 static bh_a1_rate_guard_t bh_a1_hard_guard;
 static bh_a1_rate_guard_t bh_a1_headroom_guard;
 
@@ -286,46 +273,4 @@ static bool bh_ramp_current(float from, float to, float seconds) {
 		chThdSleepMilliseconds(1);
 	}
 	return true;
-}
-
-static bool bh_measure_dc_point(float target, float *i_avg, float *v_avg,
-		float *a1_avg) {
-	// The old low-current routine dwelled for almost a second per point. With a
-	// 5 A R measurement that would self-heat this tiny winding and bias the fit.
-	// These short ramps/holds give the current loop ample time to settle while
-	// keeping each high-current pulse below about 0.1 s.
-	if (!bh_ramp_current(0.0f, target, 0.020f)) {
-		return false;
-	}
-	if (!bh_wait_and_check(0.020f)) {
-		return false;
-	}
-
-	double isum = 0.0;
-	double vsum = 0.0;
-	double a1sum = 0.0;
-	const int samples = 80;
-	for (int i = 0; i < samples; i++) {
-		if (bh_stop_requested) {
-			return false;
-		}
-		bh_apply_current(target);
-		isum += bh_coil_current();
-		vsum += bh_line_voltage();
-		a1sum += bh_sense_out_v();
-		mc_fault_code fault = mc_interface_get_fault();
-		if (fault != FAULT_CODE_NONE) {
-			commands_printf("BH_ABORT fault=%d (%s)", (int)fault,
-					mc_interface_fault_to_string(fault));
-			return false;
-		}
-		chThdSleepMicroseconds(500);
-	}
-
-	*i_avg = (float)(isum / (double)samples);
-	*v_avg = (float)(vsum / (double)samples);
-	if (a1_avg) {
-		*a1_avg = (float)(a1sum / (double)samples);
-	}
-	return bh_ramp_current(target, 0.0f, 0.010f);
 }
