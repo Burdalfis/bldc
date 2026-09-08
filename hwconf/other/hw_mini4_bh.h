@@ -94,31 +94,47 @@ static float bh_fast_b_step_scale;
 #define BH_FAST_H_PHASE_BINS 64U
 #define BH_FAST_H_PHASE_ALPHA 0.125f
 
-/* External differential RC network de-embedding.
+/* Full analog measurement-chain de-embedding.
  *
- * Physical network, per the current fixture:
+ * Physical differential network, per the current fixture:
  *   each leg: 91R -> node 1 -> 91R -> INA input
  *   node 1 differential C: 100 nF + 680 nF = 780 nF
  *   INA-node differential C: 100 nF
  *   INA-node common-mode C: 470 nF from each input to ground
+ *   INA282 differential input resistance: approximately 6 kohm
  *
  * Under differential/odd-mode excitation the half-circuit is therefore:
  *   R1 = R2 = 91 ohm
  *   C1 = 2 * 780 nF = 1.56 uF
  *   C2 = 2 * 100 nF + 470 nF = 0.67 uF
+ *   Rload = 6 kohm / 2 = 3 kohm
  *
- * Its differential transfer is:
- *   H(s) = 1 / (1 + A*s + B*s^2)
- * where A = 263.9 us and B = 8.6553012e-9 s^2.
+ * Including that finite load, the external network is:
+ *   Hext(s) = G0 / (1 + Aext*s + Bext*s^2)
+ *   G0   = 0.9428032684
+ *   Aext = 252.8656065 us
+ *   Bext = 8.160246260e-9 s^2
+ *
+ * Approximate the INA282's roughly 10 kHz signal bandwidth as one first-order
+ * pole, tau = 1/(2*pi*10 kHz) = 15.91549431 us. Multiplying that pole by Hext
+ * creates a third-order denominator. Across the tracer's <=200 Hz range its
+ * cubic term is negligible, so retain only the first two dynamic coefficients:
+ *   A = Aext + tau        = 268.7811008 us
+ *   B = Bext + Aext*tau   = 1.218472738e-8 s^2
+ *
+ * The resulting second-order approximation differs from the full three-pole
+ * model by less than about 0.025 percent in complex response at 200 Hz while
+ * avoiding a noisy third derivative in the realtime inverse.
  *
  * Search voltage is integrated to obtain B, and integration commutes with this
- * LTI filter, so the same H(s) relates measured B to true B. De-embed with:
- *   Btrue = Bmeas + A*dBmeas/dt + B*d2Bmeas/dt2.
+ * LTI chain, so de-embed measured B with:
+ *   Btrue = (1/G0) * (Bmeas + A*dBmeas/dt + B*d2Bmeas/dt2).
  * dB/dt comes directly from the measured search voltage; d2B/dt2 is obtained
  * from a second-order backward difference of that already median-filtered voltage.
  */
-#define BH_FAST_RC_INV_A_S  0.0002639f
-#define BH_FAST_RC_INV_B_S2 8.6553012e-9f
+#define BH_FAST_ANALOG_INV_DC_GAIN 1.0606666667f
+#define BH_FAST_ANALOG_INV_A_S     0.000268781101f
+#define BH_FAST_ANALOG_INV_B_S2    1.21847274e-8f
 
 static bool bh_fast_plot_started = false;
 static unsigned bh_fast_plot_elapsed_ms = 0U;
@@ -137,10 +153,10 @@ static unsigned bh_fast_b_center_hist_count = 0U;
 static unsigned bh_fast_b_center_hist_next = 0U;
 static float bh_fast_b_center = 0.0f;
 
-/* RC inverse runtime state. Coefficients are derived once after fast_reset_state
- * has established dt and the B integration scale, so the PWM-rate path only
- * performs multiplies/adds. bh_fast_rc_d2_coeff multiplies the second-order
- * backward-difference numerator (3*v[n]-4*v[n-1]+v[n-2]).
+/* Analog inverse runtime state. Coefficients are derived once after
+ * fast_reset_state has established dt and the B integration scale, so the
+ * PWM-rate path only performs multiplies/adds. bh_fast_rc_d2_coeff multiplies
+ * the second-order backward-difference numerator (3*v[n]-4*v[n-1]+v[n-2]).
  */
 static float bh_fast_rc_d1_coeff = 0.0f;
 static float bh_fast_rc_d2_coeff = 0.0f;
@@ -174,8 +190,8 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
         bh_fast_b_deembedded = 0.0f;
         if (bh_fast_dt > 1.0e-9f) {
             float inv_na = 2.0f * bh_fast_b_step_scale / bh_fast_dt;
-            bh_fast_rc_d1_coeff = BH_FAST_RC_INV_A_S * inv_na;
-            bh_fast_rc_d2_coeff = BH_FAST_RC_INV_B_S2 * inv_na /
+            bh_fast_rc_d1_coeff = BH_FAST_ANALOG_INV_A_S * inv_na;
+            bh_fast_rc_d2_coeff = BH_FAST_ANALOG_INV_B_S2 * inv_na /
                     (2.0f * bh_fast_dt);
         } else {
             bh_fast_rc_d1_coeff = 0.0f;
@@ -204,7 +220,7 @@ static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
             commands_init_plot("H (A/m)", "B relative (T)");
             commands_plot_add_graph("B-H fast live");
             commands_plot_set_graph(0);
-            commands_printf("BH_FAST_PLOT Bcenter=%ucy A1dc=%ucy Havg=%ubin/~8cy budget=%u points/s RC-deembed=on",
+            commands_printf("BH_FAST_PLOT Bcenter=%ucy A1dc=%ucy Havg=%ubin/~8cy budget=%u points/s analog-deembed=on",
                     (unsigned)BH_FAST_B_CENTER_CYCLES,
                     (unsigned)BH_FAST_A1_BIAS_CYCLES,
                     (unsigned)BH_FAST_H_PHASE_BINS,
@@ -310,9 +326,9 @@ static void bh_fast_pwm_callback(void) {
         bh_fast_cycle_vs_sum += bh_fast_last_vmed_raw;
         bh_fast_cycle_vs_count++;
 
-        /* Undo the known external two-pole RC response on B. bh_fast_last_vmed is
-         * the current median-filtered, DC-servoed search-winding voltage after
-         * INA gain and the current-indexed feedthrough LUT have been removed.
+        /* Undo the loaded external RC network plus the INA282 bandwidth on B.
+         * bh_fast_last_vmed is the current median-filtered, DC-servoed search
+         * voltage after INA gain and current-indexed feedthrough correction.
          */
         float v_now = bh_fast_last_vmed;
         float b_deembed = bh_fast_b + bh_fast_rc_d1_coeff * v_now;
@@ -328,6 +344,12 @@ static void bh_fast_pwm_callback(void) {
                     (3.0f * v_now - 4.0f * bh_fast_rc_v_prev1 +
                      bh_fast_rc_v_prev2);
         }
+
+        /* The INA input resistance causes a real DC attenuation as well as
+         * changing the RC poles, so restore the full chain's 1/G0 gain after
+         * the dynamic inverse terms have been reconstructed.
+         */
+        b_deembed *= BH_FAST_ANALOG_INV_DC_GAIN;
 
         bh_fast_rc_v_prev2 = bh_fast_rc_v_prev1;
         bh_fast_rc_v_prev1 = v_now;
@@ -459,8 +481,9 @@ static void bh_init_commands(void) {
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
 #undef bh_release_locked
-#undef BH_FAST_RC_INV_B_S2
-#undef BH_FAST_RC_INV_A_S
+#undef BH_FAST_ANALOG_INV_B_S2
+#undef BH_FAST_ANALOG_INV_A_S
+#undef BH_FAST_ANALOG_INV_DC_GAIN
 #undef BH_FAST_B_CENTER_CYCLES
 #undef BH_FAST_PLOT_PERIOD_MS
 #undef BH_FAST_H_PHASE_ALPHA
