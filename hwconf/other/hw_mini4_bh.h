@@ -79,11 +79,14 @@ static volatile bool bh_fast_external_stop;
 #undef timer_sleep
 
 /* The decimated acquisition include defines these with initializers below.
- * Tentative declarations let the worker-side plot wrapper snapshot them without
- * moving any transport work into the FOC callback.
+ * Tentative declarations let the worker-side plot/RC helpers use them before
+ * hw_mini4_bh_fast.inc is expanded. bh_fast_dt and bh_fast_b_step_scale are
+ * initialized by fast_reset_state before the keeper-current setup uses them.
  */
 static volatile float bh_fast_last_h;
 static volatile float bh_fast_last_b;
+static float bh_fast_dt;
+static float bh_fast_b_step_scale;
 
 #define BH_FAST_PLOT_PERIOD_MS 4U
 #define BH_FAST_B_CENTER_CYCLES 16U
