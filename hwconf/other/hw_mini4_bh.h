@@ -79,7 +79,7 @@ static volatile bool bh_fast_external_stop;
 #undef timer_sleep
 
 /* The decimated acquisition include defines these with initializers below.
- * Tentative declarations let the worker-side plot/RC helpers use them before
+ * Tentative declarations let the worker-side plot/analog helpers use them before
  * hw_mini4_bh_fast.inc is expanded. bh_fast_dt and bh_fast_b_step_scale are
  * initialized by fast_reset_state before the keeper-current setup uses them.
  */
@@ -89,7 +89,7 @@ static float bh_fast_dt;
 static float bh_fast_b_step_scale;
 
 #define BH_FAST_PLOT_PERIOD_MS 4U
-#define BH_FAST_B_CENTER_CYCLES 16U
+#define BH_FAST_STARTUP_CYCLES 16U
 #define BH_FAST_A1_BIAS_CYCLES 16U
 #define BH_FAST_H_PHASE_BINS 64U
 #define BH_FAST_H_PHASE_ALPHA 0.125f
@@ -139,19 +139,26 @@ static float bh_fast_b_step_scale;
 static bool bh_fast_plot_started = false;
 static unsigned bh_fast_plot_elapsed_ms = 0U;
 
-/* B is an integral, so its absolute DC origin is arbitrary. Once the A1/search
- * voltage DC servo below has removed integrator velocity, use the rolling mean
- * of complete-cycle B means only as a displayed vertical translation. This does
- * not feed back into A1, the raw B integrator, or the magnetic-loop shape.
+/* Startup deliberately produces no Experiment Plot points. First let the
+ * 16-cycle A1-DC estimator and phase-synchronous H profile settle. At the next
+ * cycle boundary reset only the B integrator, preserving all analog/filter
+ * history. Integrate one complete clean cycle, use its mean de-embedded B as a
+ * fixed display origin, then begin plotting. The B origin is never moved again
+ * during that run; any remaining integrator velocity must be corrected at A1.
  */
 static volatile bool bh_fast_center_ready = false;
+static bool bh_fast_center_cycle_active = false;
+static unsigned bh_fast_startup_cycles_done = 0U;
 static float bh_fast_cycle_b_sum = 0.0f;
 static unsigned bh_fast_cycle_b_count = 0U;
-static float bh_fast_b_center_hist[BH_FAST_B_CENTER_CYCLES] = {0.0f};
-static float bh_fast_b_center_hist_sum = 0.0f;
-static unsigned bh_fast_b_center_hist_count = 0U;
-static unsigned bh_fast_b_center_hist_next = 0U;
 static float bh_fast_b_center = 0.0f;
+
+/* Diagnostic A/B switch for the RAM-only current-indexed A1 feedthrough LUT.
+ * bh_measure_rl normally makes bh_sense_pwm_lut_valid true. The command below
+ * can temporarily clear that validity bit while retaining the table contents,
+ * then restore it without re-running the R/L measurement.
+ */
+static bool bh_fast_a1_lut_saved_valid = false;
 
 /* Analog inverse runtime state. Coefficients are derived once after
  * fast_reset_state has established dt and the B integration scale, so the
@@ -176,12 +183,10 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
         bh_fast_plot_started = false;
         bh_fast_plot_elapsed_ms = 0U;
         bh_fast_center_ready = false;
+        bh_fast_center_cycle_active = false;
+        bh_fast_startup_cycles_done = 0U;
         bh_fast_cycle_b_sum = 0.0f;
         bh_fast_cycle_b_count = 0U;
-        memset(bh_fast_b_center_hist, 0, sizeof(bh_fast_b_center_hist));
-        bh_fast_b_center_hist_sum = 0.0f;
-        bh_fast_b_center_hist_count = 0U;
-        bh_fast_b_center_hist_next = 0U;
         bh_fast_b_center = 0.0f;
 
         bh_fast_rc_v_prev1 = 0.0f;
@@ -210,9 +215,8 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
  * never a catch-up burst. With the normal 1 ms loop and a 4 ms period the hard
  * transport budget is approximately 250 H/B points per second.
  *
- * Plotting begins after the first complete excitation cycle supplies a mean-B
- * center. The rolling A1 bias, B center and phase-synchronous H profile continue
- * converging in the background without any within-cycle parameter changes.
+ * Plotting is suppressed for 16 estimator-settling cycles plus one dedicated
+ * B-center cycle. Once enabled, the B display center is fixed for the run.
  */
 static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
     if (bh_fast_active && bh_fast_center_ready) {
@@ -220,8 +224,8 @@ static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
             commands_init_plot("H (A/m)", "B relative (T)");
             commands_plot_add_graph("B-H fast live");
             commands_plot_set_graph(0);
-            commands_printf("BH_FAST_PLOT Bcenter=%ucy A1dc=%ucy Havg=%ubin/~8cy budget=%u points/s analog-deembed=on",
-                    (unsigned)BH_FAST_B_CENTER_CYCLES,
+            commands_printf("BH_FAST_PLOT startup=%ucy+1center A1dc=%ucy Havg=%ubin/~8cy fixed-B-center budget=%u points/s analog-deembed=on",
+                    (unsigned)BH_FAST_STARTUP_CYCLES,
                     (unsigned)BH_FAST_A1_BIAS_CYCLES,
                     (unsigned)BH_FAST_H_PHASE_BINS,
                     (unsigned)(1000U / BH_FAST_PLOT_PERIOD_MS));
@@ -360,12 +364,13 @@ static void bh_fast_pwm_callback(void) {
         bh_fast_b_deembedded = b_deembed;
         bh_fast_last_b = b_deembed - bh_fast_b_center;
 
-        /* Estimate only the arbitrary B origin from complete-cycle means. The
-         * center is constant throughout each cycle and never feeds back into
-         * search voltage or the raw B integrator.
+        /* Only the one dedicated center cycle contributes to the fixed display
+         * origin. Warm-up cycles and plotted cycles never move B center.
          */
-        bh_fast_cycle_b_sum += b_deembed;
-        bh_fast_cycle_b_count++;
+        if (bh_fast_center_cycle_active) {
+            bh_fast_cycle_b_sum += b_deembed;
+            bh_fast_cycle_b_count++;
+        }
     }
 
     bh_fast_sample_n++;
@@ -412,8 +417,8 @@ static void bh_fast_pwm_callback(void) {
 
             /* The bias is frozen for the entire next cycle. Shift only states
              * expressed in the post-bias reference so the cycle-boundary update
-             * does not create a fake trapezoid or RC-derivative impulse. vhist
-             * and last_good_vs remain intentionally pre-bias.
+             * does not create a fake trapezoid or analog-inverse derivative impulse.
+             * vhist and last_good_vs remain intentionally pre-bias.
              */
             if (bh_fast_have_vmed) {
                 bh_fast_last_vmed -= delta_vs_bias;
@@ -426,30 +431,31 @@ static void bh_fast_pwm_callback(void) {
             }
         }
 
-        if (bh_fast_cycle_b_count > 0U) {
-            float cycle_mean_b = bh_fast_cycle_b_sum /
-                    (float)bh_fast_cycle_b_count;
-
-            if (bh_fast_b_center_hist_count < BH_FAST_B_CENTER_CYCLES) {
-                bh_fast_b_center_hist[bh_fast_b_center_hist_next] = cycle_mean_b;
-                bh_fast_b_center_hist_sum += cycle_mean_b;
-                bh_fast_b_center_hist_count++;
+        /* No B points are plotted while the A1-DC and H estimators fill. At the
+         * end of the 16th warm-up cycle, throw away only the accumulated B state
+         * and begin one dedicated clean center cycle. Preserve A1/median/analog
+         * history so this reset cannot create a fresh filter transient.
+         */
+        if (!bh_fast_center_ready) {
+            if (bh_fast_center_cycle_active) {
+                if (bh_fast_cycle_b_count > 0U) {
+                    bh_fast_b_center = bh_fast_cycle_b_sum /
+                            (float)bh_fast_cycle_b_count;
+                    bh_fast_center_ready = true;
+                    bh_fast_center_cycle_active = false;
+                    bh_fast_last_b = bh_fast_b_deembedded - bh_fast_b_center;
+                }
             } else {
-                bh_fast_b_center_hist_sum -=
-                        bh_fast_b_center_hist[bh_fast_b_center_hist_next];
-                bh_fast_b_center_hist[bh_fast_b_center_hist_next] = cycle_mean_b;
-                bh_fast_b_center_hist_sum += cycle_mean_b;
+                bh_fast_startup_cycles_done++;
+                if (bh_fast_startup_cycles_done >= BH_FAST_STARTUP_CYCLES) {
+                    bh_fast_b = 0.0f;
+                    bh_fast_b_deembedded = 0.0f;
+                    bh_fast_last_b = 0.0f;
+                    bh_fast_cycle_b_sum = 0.0f;
+                    bh_fast_cycle_b_count = 0U;
+                    bh_fast_center_cycle_active = true;
+                }
             }
-
-            bh_fast_b_center_hist_next++;
-            if (bh_fast_b_center_hist_next >= BH_FAST_B_CENTER_CYCLES) {
-                bh_fast_b_center_hist_next = 0U;
-            }
-
-            bh_fast_b_center = bh_fast_b_center_hist_sum /
-                    (float)bh_fast_b_center_hist_count;
-            bh_fast_center_ready = true;
-            bh_fast_last_b = bh_fast_b_deembedded - bh_fast_b_center;
         }
 
         bh_fast_cycle_vs_sum = 0.0f;
@@ -464,10 +470,50 @@ static void bh_fast_pwm_callback(void) {
 
 #include "hw_mini4_bh_worker_v2.inc"
 
-/* Keep terminal_v2 intact: rename its initializer, then wrap it so the live
- * and fast-live commands are registered too. The old zero-state diagnostic
- * commands were useful while debugging timeout/PWM behavior, but leaving them
- * linked costs precious MINI4 flash.
+/* RAM-only diagnostic switch for A/B testing the current-indexed A1 LUT after
+ * bh_measure_rl has established both R/L and the table. Disabling does not touch
+ * bh_rl_valid or erase the LUT arrays, so it can be restored immediately.
+ */
+static void terminal_bh_a1_lut(int argc, const char **argv) {
+    if (bh_is_busy()) {
+        commands_printf("A B-H job is running or queued. Use bh_stop before changing A1 LUT state.");
+        return;
+    }
+
+    if (argc == 1) {
+        commands_printf("BH_A1_LUT %s saved=%s",
+                bh_sense_pwm_lut_valid ? "enabled" : "disabled",
+                bh_fast_a1_lut_saved_valid ? "yes" : "no");
+        return;
+    }
+
+    if (argc != 2 || (strcmp(argv[1], "0") != 0 && strcmp(argv[1], "1") != 0)) {
+        commands_printf("Usage: bh_a1_lut [0|1]");
+        commands_printf("  0 = bypass current-indexed A1 feedthrough LUT; 1 = restore it");
+        return;
+    }
+
+    if (argv[1][0] == '0') {
+        if (bh_sense_pwm_lut_valid) {
+            bh_fast_a1_lut_saved_valid = true;
+        }
+        bh_sense_pwm_lut_valid = false;
+        commands_printf("BH_A1_LUT disabled; R/L state retained and LUT samples left in RAM");
+    } else {
+        if (bh_sense_pwm_lut_valid) {
+            bh_fast_a1_lut_saved_valid = true;
+            commands_printf("BH_A1_LUT enabled");
+        } else if (bh_fast_a1_lut_saved_valid) {
+            bh_sense_pwm_lut_valid = true;
+            commands_printf("BH_A1_LUT enabled from retained RAM table");
+        } else {
+            commands_printf("BH_A1_LUT cannot enable: no retained valid LUT; run bh_measure_rl first");
+        }
+    }
+}
+
+/* Keep terminal_v2 intact: rename its initializer, then wrap it so the live,
+ * fast-live and A1-LUT diagnostic commands are registered too.
  */
 #define bh_init_commands bh_init_commands_v2_base
 #include "hw_mini4_bh_terminal_v2.inc"
@@ -476,6 +522,11 @@ static void bh_init_commands(void) {
     bh_init_commands_v2_base();
     bh_live_init_commands();
     bh_fast_init_commands();
+    terminal_register_command_callback(
+            "bh_a1_lut",
+            "Enable/bypass the retained current-indexed A1 feedthrough LUT.",
+            "[0|1]",
+            terminal_bh_a1_lut);
 }
 
 #undef bh_set_measurement_gains
@@ -484,7 +535,7 @@ static void bh_init_commands(void) {
 #undef BH_FAST_ANALOG_INV_B_S2
 #undef BH_FAST_ANALOG_INV_A_S
 #undef BH_FAST_ANALOG_INV_DC_GAIN
-#undef BH_FAST_B_CENTER_CYCLES
+#undef BH_FAST_STARTUP_CYCLES
 #undef BH_FAST_PLOT_PERIOD_MS
 #undef BH_FAST_H_PHASE_ALPHA
 #undef BH_FAST_H_PHASE_BINS
