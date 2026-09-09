@@ -50,6 +50,14 @@ static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 
+/* Display-only B origin. After each complete cycle, the wrapper snapshots raw
+ * Bmin/Bmax before resetting the integrator. The following cycle is plotted
+ * relative to their midpoint. Raw integration and closure diagnostics are not
+ * modified by this value.
+ */
+static unsigned bh_fast_center_cycle_seen = 0U;
+static float bh_fast_display_b_center = 0.0f;
+
 /* Decimated acquisition/filter state. Keep the known-good three-sample median
  * path and restart B integration at every excitation-cycle boundary.
  */
@@ -220,15 +228,25 @@ static inline bool bh_fast_acquire_sample(void) {
 	}
 	bh_fast_last_vmed = vmed;
 	bh_fast_have_vmed = true;
+
+	/* The wrapper updates these raw snapshots only at a completed cycle. Adopt
+	 * that cycle's midpoint once, then leave it fixed throughout the next cycle.
+	 */
+	if (bh_fast_diag_cycle != bh_fast_center_cycle_seen) {
+		bh_fast_center_cycle_seen = bh_fast_diag_cycle;
+		bh_fast_display_b_center = 0.5f *
+				(bh_fast_diag_b_min + bh_fast_diag_b_max);
+	}
+
 	bh_fast_last_h = imed * bh_fast_h_scale;
-	bh_fast_last_b = bh_fast_b;
+	bh_fast_last_b = bh_fast_b - bh_fast_display_b_center;
 	return true;
 }
 
 static bool bh_fast_install_tight_current_limits(void) {
 	mc_configuration *cfg = mempools_alloc_mcconf();
 	if (!cfg) {
-		commands_printf("BH_FAST_ABORT could not allocate temporary current-limit config");
+		commands_printf("BH_FAST_ABORT alloc limits");
 		return false;
 	}
 	*cfg = *mc_interface_get_configuration();
@@ -264,6 +282,8 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_cycle_i_min = 1.0e30f;
 	bh_fast_overcurrent_count = 0;
 	bh_fast_diag_div_count = 0U;
+	bh_fast_center_cycle_seen = 0U;
+	bh_fast_display_b_center = 0.0f;
 	bh_fast_sense_zero = sense_zero;
 	bh_fast_hist_n = 0;
 	bh_fast_b = 0.0f;
@@ -297,7 +317,7 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 static bool bh_fast_live_plot(float freq) {
 	float hardoff_zero = bh_measure_sense_zero();
 	if (!bh_sense_zero_ok) {
-		commands_printf("BH_FAST_ABORT A1 off-zero invalid V=%.6f", (double)hardoff_zero);
+		commands_printf("BH_FAST_ABORT A1zero %.6f", (double)hardoff_zero);
 		return false;
 	}
 
@@ -306,18 +326,17 @@ static bool bh_fast_live_plot(float freq) {
 	}
 	bh_fast_reset_state(freq, hardoff_zero);
 
-	commands_printf("BH_FAST_START Dpk=%.6f f=%.6f Hz foc_fs=%.1f Hz tracer_fs=%.1f Hz div=%u turns=%g/%g offzero=%.7f V sense=%+d rawSVM=1",
+	commands_printf("BH_FAST_START D=%.6f f=%.3f fs=%.0f/%.0f turns=%g/%g rawSVM",
 			(double)bh_fast_duty_pk, (double)freq, (double)bh_fast_fs,
-			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
-			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
-			(double)hardoff_zero, bh_sense_polarity);
+			(double)bh_fast_update_hz,
+			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS);
 
 	/* Enter RUNNING gently with the existing 10 mA keeper, then impose zero raw
 	 * A-B voltage and measure the A1 baseline while PWM remains active.
 	 */
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
-		commands_printf("BH_FAST_ABORT could not enter FOC RUNNING state");
+		commands_printf("BH_FAST_ABORT FOC start");
 		bh_release_locked();
 		return false;
 	}
@@ -326,14 +345,14 @@ static bool bh_fast_live_plot(float freq) {
 	float active_zero = 0.0f;
 	float zero_i = 0.0f;
 	if (!bh_fast_measure_active_zero(&active_zero, &zero_i)) {
-		commands_printf("BH_FAST_ABORT active-PWM A1 zero invalid");
+		commands_printf("BH_FAST_ABORT A1 pwm zero");
 		bh_fast_set_current_ref(0.0f);
 		bh_release_locked();
 		bh_foc_svm_override_active = false;
 		return false;
 	}
 	bh_fast_sense_zero = active_zero;
-	commands_printf("BH_FAST_A1_ZERO off=%.7f V pwm=%.7f V shift=%+.6f mV I=%+.5f A LUT=%d",
+	commands_printf("BH_FAST_A1_ZERO off=%.7f pwm=%.7f d=%+.3fmV I=%+.4f LUT=%d",
 			(double)hardoff_zero, (double)active_zero,
 			(double)((active_zero - hardoff_zero) * 1e3f),
 			(double)zero_i, bh_sense_pwm_lut_valid ? 1 : 0);
@@ -350,20 +369,17 @@ static bool bh_fast_live_plot(float freq) {
 
 		mc_fault_code fault = mc_interface_get_fault();
 		if (fault != FAULT_CODE_NONE) {
-			commands_printf("BH_FAST_ABORT fault=%d (%s)", (int)fault,
-					mc_interface_fault_to_string(fault));
+			commands_printf("BH_FAST_ABORT fault=%d", (int)fault);
 			break;
 		}
 
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
-			commands_printf("BH_FAST_STAT Dcmd=%+.6f Iamp=%.5f A Icenter=%+.5f A H=%+.2f A/m B=%+.7f T Id=%+.5f A duty=%+.5f clips=%u",
+			commands_printf("BH_FAST_STAT D=%+.5f Iamp=%.4f Ic=%+.4f H=%+.1f B=%+.6f clips=%u",
 					(double)bh_fast_last_duty_cmd,
 					(double)bh_fast_last_amp,
 					(double)bh_fast_last_center,
 					(double)bh_fast_last_h, (double)bh_fast_last_b,
-					(double)mcpwm_foc_get_id(),
-					(double)mc_interface_get_duty_cycle_now(),
 					(unsigned)bh_fast_hard_clips);
 		}
 		chThdSleepMilliseconds(1);
@@ -376,18 +392,15 @@ static bool bh_fast_live_plot(float freq) {
 	bh_foc_svm_override_active = false;
 
 	if (bh_fast_clip_abort) {
-		commands_printf("BH_FAST_DONE ABORT sustained A1 clipping (>10 hard-rail samples/s)");
+		commands_printf("BH_FAST_DONE A1 clips");
 		return false;
 	}
 	if (bh_fast_overcurrent_abort) {
-		commands_printf("BH_FAST_DONE ABORT measured current exceeded sanity limit");
+		commands_printf("BH_FAST_DONE overcurrent");
 		return false;
 	}
-	if (bh_fast_external_stop) {
-		commands_printf("BH_FAST_DONE VESC_TOOL_STOP");
-	} else {
-		commands_printf("BH_FAST_DONE STOP_REQUESTED");
-	}
+	commands_printf("BH_FAST_DONE %s",
+			bh_fast_external_stop ? "TOOL_STOP" : "STOP");
 	return true;
 }
 
