@@ -14,11 +14,13 @@
 #define BH_A1_DC_SAMPLES 40
 
 /* Nonlinear active-PWM feedthrough calibration. At settled DC excitation the
- * true search-coil voltage is zero, so A1-active minus A1-hard-off is entirely
- * fixture/controller feedthrough. Measured coil current is the independent
- * variable: unlike Vd it does not acquire an L*dI/dt term during live AC drive.
- * Segment slopes are precomputed so the hot fast-acquisition path does not
- * perform a floating-point division for interpolation.
+ * true search-coil voltage is zero. The zero-current active-PWM A1 reading is
+ * therefore the baseline, and the LUT contains only the current-dependent
+ * residual around that baseline. By construction E_I(0 A) = 0 V.
+ *
+ * Measured coil current is the independent variable: unlike Vd it does not
+ * acquire an L*dI/dt term during live AC drive. Segment slopes are precomputed
+ * so the hot fast-acquisition path does not perform a floating-point division.
  */
 static float bh_sense_pwm_i_lut[BH_A1_PWM_LUT_POINTS];
 static float bh_sense_pwm_err_lut[BH_A1_PWM_LUT_POINTS];
@@ -50,7 +52,7 @@ static inline float bh_sense_pwm_lut_error_v(float i_line) {
  * point starts and ends at zero current so high-current dwell stays brief even
  * though the calibration now has many more operating points. The zero target is
  * intentional: bh_apply_current(0) keeps FOC/PWM active, giving us the active-PWM
- * zero-current offset separately from the hard-off A1 zero.
+ * zero-current baseline separately from the hard-off A1 zero.
  */
 static bool bh_measure_dc_cal_point(float target, float *i_avg, float *vab_avg,
 		float *vd_avg, float *duty_avg, float *a1_avg) {
@@ -136,9 +138,9 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 		return false;
 	}
 
-	/* Re-measure hard-off A1 immediately before the DC sweep. The AC test may
-	 * have warmed the INA/fixture slightly, and the LUT should describe active-PWM
-	 * error relative to the most contemporaneous hard-off zero possible.
+	/* Re-measure hard-off A1 immediately before the DC sweep. Keep this value
+	 * for diagnostics only; the nonlinear LUT below is referenced to the active
+	 * zero-current PWM point, not to this hard-off value.
 	 */
 	float dc_sense_zero = bh_measure_sense_zero();
 	if (!bh_sense_zero_ok) {
@@ -151,6 +153,7 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 			BH_A1_PWM_LUT_POINTS, (double)dc_sense_zero);
 
 	float lut_i[BH_A1_PWM_LUT_POINTS];
+	float lut_a1[BH_A1_PWM_LUT_POINTS];
 	float lut_err[BH_A1_PWM_LUT_POINTS];
 	double si = 0.0, sv = 0.0, sii = 0.0, siv = 0.0;
 
@@ -167,18 +170,44 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 			return false;
 		}
 
-		float err = a1 - dc_sense_zero;
 		lut_i[n] = ia;
-		lut_err[n] = err;
-		commands_printf("BH_R_POINT idx=%d frac=%+.3f I=%+.7f A Vd=%+.7f V Vab=%+.7f V duty=%+.6f A1=%.7f V Err=%+.6f mV",
+		lut_a1[n] = a1;
+		commands_printf("BH_R_POINT idx=%d frac=%+.3f I=%+.7f A Vd=%+.7f V Vab=%+.7f V duty=%+.6f A1=%.7f V HardErr=%+.6f mV",
 				n, (double)frac, (double)ia, (double)vd, (double)vab,
-				(double)duty, (double)a1, (double)(err * 1e3f));
+				(double)duty, (double)a1,
+				(double)((a1 - dc_sense_zero) * 1e3f));
 
 		si += ia;
 		sv += vab;
 		sii += (double)ia * ia;
 		siv += (double)ia * vab;
 	}
+
+	const int zero_idx = BH_A1_PWM_LUT_POINTS / 2;
+	float pwm_zero = lut_a1[zero_idx];
+	float zero_i_meas = lut_i[zero_idx];
+	if (!isfinite(pwm_zero) || !isfinite(zero_i_meas) ||
+			fabsf(zero_i_meas) > fmaxf(0.10f, current * 0.05f)) {
+		commands_printf("BH_RL_ABORT active-PWM zero invalid A1=%.7f V I=%+.6f A",
+				(double)pwm_zero, (double)zero_i_meas);
+		bh_release_locked();
+		return false;
+	}
+
+	/* Define the current-dependent correction around active-PWM zero. Force the
+	 * center knot to exactly (0 A, 0 V); the measured near-zero current is still
+	 * retained above for the resistance fit and diagnostic print.
+	 */
+	for (int n = 0; n < BH_A1_PWM_LUT_POINTS; n++) {
+		lut_err[n] = lut_a1[n] - pwm_zero;
+	}
+	lut_i[zero_idx] = 0.0f;
+	lut_err[zero_idx] = 0.0f;
+
+	commands_printf("BH_A1_PWM_ZERO hardoff=%.7f V active=%.7f V shift=%+.6f mV I=%+.6f A",
+			(double)dc_sense_zero, (double)pwm_zero,
+			(double)((pwm_zero - dc_sense_zero) * 1e3f),
+			(double)zero_i_meas);
 
 	const double npts = (double)BH_A1_PWM_LUT_POINTS;
 	double den = npts * sii - si * si;
@@ -237,11 +266,11 @@ static bool bh_measure_rl_locked(mc_configuration *cfg, float current, float fre
 					 bh_sense_pwm_err_lut[i]) / di;
 		}
 		bh_sense_pwm_lut_valid = true;
-		commands_printf("BH_A1_PWM_LUT valid points=%d I=[%+.7f,%+.7f] A A1off=%.7f V",
+		commands_printf("BH_A1_PWM_LUT valid points=%d I=[%+.7f,%+.7f] A A1pwm0=%.7f V",
 				BH_A1_PWM_LUT_POINTS,
 				(double)bh_sense_pwm_i_lut[0],
 				(double)bh_sense_pwm_i_lut[BH_A1_PWM_LUT_POINTS - 1],
-				(double)dc_sense_zero);
+				(double)pwm_zero);
 		for (int i = 0; i < BH_A1_PWM_LUT_POINTS; i++) {
 			commands_printf("BH_A1_LUT idx=%d I=%+.7f A Err=%+.6f mV",
 					i, (double)bh_sense_pwm_i_lut[i],
