@@ -48,7 +48,6 @@ static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 
-/* Plot-only origin, derived from corrected extrema of the previous cycle. */
 static unsigned bh_fast_center_cycle_seen = 0U;
 static float bh_fast_display_b_center = 0.0f;
 static float bh_fast_bc_min = 0.0f;
@@ -58,7 +57,6 @@ static bool bh_fast_bc_have = false;
 static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
 static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
 static int bh_fast_hist_n = 0;
-/* bh_fast_b and bh_fast_last_vmed remain RAW for cycle diagnostics. */
 static float bh_fast_b = 0.0f;
 static float bh_fast_last_vmed = 0.0f;
 static bool bh_fast_have_vmed = false;
@@ -66,10 +64,6 @@ static float bh_fast_last_good_vs = 0.0f;
 static int bh_fast_clip_window_samples = 0;
 static int bh_fast_clip_window_events = 0;
 
-/* Shared inverse-filter history. Direct voltage inversion is used only for the
- * phase-C scope diagnostic. B plotting uses the better-conditioned B-domain
- * inverse: Btrue=(Bm + A*V/(NA) + B*dV/dt/(NA))/G0.
- */
 static float bh_fast_de_v1 = 0.0f;
 static float bh_fast_de_v2 = 0.0f;
 static float bh_fast_de_k1 = 0.0f;
@@ -92,7 +86,7 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	return b;
 }
 
-/* Deliberately aggressive direct inverse for Sampled Data only. */
+/* Direct inverse is scope-only; plotted B uses the B-domain inverse below. */
 static inline float bh_fast_deembed_vs(float v) {
 	float out = v;
 	if (bh_fast_de_n == 1U) {
@@ -202,7 +196,6 @@ static inline bool bh_fast_acquire_sample(void) {
 	float vmed = bh_fast_median3(
 			bh_fast_vhist[0], bh_fast_vhist[1], bh_fast_vhist[2]);
 
-	/* Snapshot history before the scope-only direct inverse advances it. */
 	float pv1 = bh_fast_de_v1;
 	float pv2 = bh_fast_de_v2;
 	unsigned pn = bh_fast_de_n;
@@ -223,16 +216,12 @@ static inline bool bh_fast_acquire_sample(void) {
 		bh_fast_overcurrent_count = 0;
 	}
 
-	/* Integrate the measured, median-filtered voltage. Raw closure diagnostics
-	 * therefore stay raw and cannot be hidden by the analog inverse.
-	 */
 	if (bh_fast_have_vmed) {
 		bh_fast_b += (bh_fast_last_vmed + vmed) * bh_fast_b_step_scale;
 	}
 	bh_fast_last_vmed = vmed;
 	bh_fast_have_vmed = true;
 
-	/* B-domain inverse needs only dV/dt, not d2V/dt2. */
 	float bc = bh_fast_b + bh_fast_de_bv * vmed;
 	if (pn == 1U) {
 		bc += 2.0f * bh_fast_de_bd * (vmed - pv1);
@@ -242,9 +231,6 @@ static inline bool bh_fast_acquire_sample(void) {
 	}
 	bc *= BH_FAST_A1_INV_GAIN;
 
-	/* At the first sample of a new cycle, center it using corrected extrema from
-	 * the completed cycle. The center then stays fixed for the whole cycle.
-	 */
 	if (bh_fast_diag_cycle != bh_fast_center_cycle_seen) {
 		bh_fast_center_cycle_seen = bh_fast_diag_cycle;
 		if (bh_fast_bc_have) {
@@ -269,10 +255,7 @@ static inline bool bh_fast_acquire_sample(void) {
 
 static bool bh_fast_install_tight_current_limits(void) {
 	mc_configuration *cfg = mempools_alloc_mcconf();
-	if (!cfg) {
-		commands_printf("BH_FAST_ABORT alloc");
-		return false;
-	}
+	if (!cfg) return false;
 	*cfg = *mc_interface_get_configuration();
 
 	float axis_req = bh_i_pk * BH_TWO_BY_SQRT3;
@@ -349,20 +332,17 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 static bool bh_fast_live_plot(float freq) {
 	float hardoff_zero = bh_measure_sense_zero();
 	if (!bh_sense_zero_ok) {
-		commands_printf("BH_FAST_ABORT A1zero %.6f", (double)hardoff_zero);
+		commands_printf("BH A0 %.4f", (double)hardoff_zero);
 		return false;
 	}
 	if (!bh_fast_install_tight_current_limits()) return false;
 	bh_fast_reset_state(freq, hardoff_zero);
 
-	commands_printf("BH_FAST_START D=%.6f f=%.3f fs=%.0f/%.0f turns=%g/%g rawSVM",
-			(double)bh_fast_duty_pk, (double)freq, (double)bh_fast_fs,
-			(double)bh_fast_update_hz,
-			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS);
+	commands_printf("BH F D=%.4f f=%.1f", (double)bh_fast_duty_pk, (double)freq);
 
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
-		commands_printf("BH_FAST_ABORT FOC");
+		commands_printf("BH FOC!");
 		bh_release_locked();
 		return false;
 	}
@@ -371,14 +351,14 @@ static bool bh_fast_live_plot(float freq) {
 	float active_zero = 0.0f;
 	float zero_i = 0.0f;
 	if (!bh_fast_measure_active_zero(&active_zero, &zero_i)) {
-		commands_printf("BH_FAST_ABORT A1zeroPWM");
+		commands_printf("BH A1!");
 		bh_fast_set_current_ref(0.0f);
 		bh_release_locked();
 		bh_foc_svm_override_active = false;
 		return false;
 	}
 	bh_fast_sense_zero = active_zero;
-	commands_printf("BH_FAST_A1_ZERO off=%.7f pwm=%.7f d=%+.3fmV I=%+.4f LUT=%d",
+	commands_printf("BH A1 %.5f %.5f %+.2f %+.3f L%d",
 			(double)hardoff_zero, (double)active_zero,
 			(double)((active_zero - hardoff_zero) * 1e3f),
 			(double)zero_i, bh_sense_pwm_lut_valid ? 1 : 0);
@@ -395,18 +375,16 @@ static bool bh_fast_live_plot(float freq) {
 
 		mc_fault_code fault = mc_interface_get_fault();
 		if (fault != FAULT_CODE_NONE) {
-			commands_printf("BH_FAST_ABORT fault=%d", (int)fault);
+			commands_printf("BH FLT%d", (int)fault);
 			break;
 		}
 
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
-			commands_printf("BH_FS D=%+.5f Ia=%.4f Ic=%+.4f H=%+.1f B=%+.6f c=%u",
+			commands_printf("BH S %.4f %.3f %+.0f %+.4f",
 					(double)bh_fast_last_duty_cmd,
 					(double)bh_fast_last_amp,
-					(double)bh_fast_last_center,
-					(double)bh_fast_last_h, (double)bh_fast_last_b,
-					(unsigned)bh_fast_hard_clips);
+					(double)bh_fast_last_h, (double)bh_fast_last_b);
 		}
 		chThdSleepMilliseconds(1);
 	}
@@ -418,27 +396,19 @@ static bool bh_fast_live_plot(float freq) {
 	bh_foc_svm_override_active = false;
 
 	if (bh_fast_clip_abort) {
-		commands_printf("BH_FAST_DONE clips");
+		commands_printf("BH clips");
 		return false;
 	}
 	if (bh_fast_overcurrent_abort) {
-		commands_printf("BH_FAST_DONE OC");
+		commands_printf("BH OC");
 		return false;
 	}
-	commands_printf("BH_FAST_DONE %s",
-			bh_fast_external_stop ? "TOOL_STOP" : "STOP");
 	return true;
 }
 
 static void terminal_bh_live_fast(int argc, const char **argv) {
-	if (bh_is_busy()) {
-		commands_printf("BH busy");
-		return;
-	}
-	if (argc != 5) {
-		commands_printf("Use bh_live_fast D f path area");
-		return;
-	}
+	if (bh_is_busy()) return;
+	if (argc != 5) return;
 	float i_pk = strtof(argv[1], 0);
 	float freq = strtof(argv[2], 0);
 	float path_mm = strtof(argv[3], 0);
@@ -454,13 +424,11 @@ static void terminal_bh_live_fast(int argc, const char **argv) {
 		bh_fast_live_mode = false;
 		return;
 	}
-	commands_printf("BH fast queued");
 }
 
 static void bh_fast_init_commands(void) {
 	terminal_register_command_callback(
-			"bh_live_fast", "Duty B-H tracer.",
-			"<D> <f> <path> <area>", terminal_bh_live_fast);
+			"bh_live_fast", "BH", "D f p a", terminal_bh_live_fast);
 }
 
 #undef BH_FAST_A1_INV_B_S2
