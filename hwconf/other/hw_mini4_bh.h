@@ -69,18 +69,57 @@ static volatile bool bh_fast_external_stop;
 static volatile float bh_fast_last_h;
 static volatile float bh_fast_last_b;
 
-#define BH_FAST_PLOT_PERIOD_MS 4U
-static bool bh_fast_plot_started = false;
-static unsigned bh_fast_plot_elapsed_ms = 0U;
+#define BH_FAST_PLOT_PERIOD_MS          4U
+#define BH_FAST_DIAG_REPORT_MS          1000U
+#define BH_FAST_DUTY_LINE_LIMIT_A       5.0f
 
-/* Give fast-mode startup a harmless nonzero target so FOC is already RUNNING
- * before its callback takes over. Once the callback owns the current reference,
- * unlock ordinary mc_interface input so VESC Tool Stop/release can reach FOC.
+/* bh_live_fast is now voltage/duty driven. The public argument is peak duty
+ * magnitude 0..1. Internally the existing triangle reference is used only as
+ * a normalized -1..+1 waveform; the ordinary FOC current PI is bypassed by
+ * translating it into fixed-axis open-loop duty. H remains measured current.
+ */
+static float bh_fast_duty_pk = 0.0f;
+static volatile float bh_fast_last_duty_cmd = 0.0f;
+
+/* Cycle-closure diagnostics. These are snapshots only: nothing here feeds back
+ * into A1, B, H, duty, centering, or any other estimator state.
+ */
+static float bh_fast_diag_vs_sum = 0.0f;
+static unsigned bh_fast_diag_vs_count = 0U;
+static float bh_fast_diag_b_min_work = 0.0f;
+static float bh_fast_diag_b_max_work = 0.0f;
+static bool bh_fast_diag_have_b = false;
+static volatile unsigned bh_fast_diag_cycle = 0U;
+static volatile float bh_fast_diag_i_wrap = 0.0f;
+static volatile float bh_fast_diag_duty_wrap = 0.0f;
+static volatile float bh_fast_diag_b_close = 0.0f;
+static volatile float bh_fast_diag_b_min = 0.0f;
+static volatile float bh_fast_diag_b_max = 0.0f;
+static volatile float bh_fast_diag_vs_mean = 0.0f;
+static unsigned bh_fast_diag_report_elapsed_ms = 0U;
+static unsigned bh_fast_diag_last_reported_cycle = 0U;
+
+static inline void bh_fast_diag_reset_work(void) {
+    bh_fast_diag_vs_sum = 0.0f;
+    bh_fast_diag_vs_count = 0U;
+    bh_fast_diag_b_min_work = 0.0f;
+    bh_fast_diag_b_max_work = 0.0f;
+    bh_fast_diag_have_b = false;
+}
+
+/* Give fast-mode startup a harmless nonzero current target so FOC is already
+ * RUNNING before the fast callback takes over. This is startup-only; the live
+ * excitation itself is open-loop duty after the include hook below.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
         bh_fast_plot_started = false;
         bh_fast_plot_elapsed_ms = 0U;
+        bh_fast_diag_report_elapsed_ms = 0U;
+        bh_fast_diag_last_reported_cycle = 0U;
+        bh_fast_diag_cycle = 0U;
+        bh_fast_last_duty_cmd = 0.0f;
+        bh_fast_diag_reset_work();
         i_line = 0.010f;
     }
     bh_apply_current(i_line);
@@ -88,15 +127,18 @@ static inline void bh_fast_apply_keeper_current(float i_line) {
 }
 
 /* Keep Experiment Plot worker-side and lossy, with the same 250 point/s budget
- * as the known-good baseline. No estimator state is updated from this worker.
+ * as the known-good baseline. Once per second also print the newest complete
+ * cycle diagnostic snapshot. No diagnostic work is transmitted from the ISR.
  */
+static bool bh_fast_plot_started = false;
+static unsigned bh_fast_plot_elapsed_ms = 0U;
 static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
     if (bh_fast_active) {
         if (!bh_fast_plot_started) {
             commands_init_plot("H (A/m)", "B relative (T)");
             commands_plot_add_graph("B-H fast live");
             commands_plot_set_graph(0);
-            commands_printf("BH_FAST_PLOT simple per-cycle baseline, budget=%u points/s",
+            commands_printf("BH_FAST_PLOT duty baseline, budget=%u points/s",
                     (unsigned)(1000U / BH_FAST_PLOT_PERIOD_MS));
             bh_fast_plot_started = true;
             bh_fast_plot_elapsed_ms = 0U;
@@ -105,18 +147,72 @@ static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
         bh_fast_plot_elapsed_ms += sleep_ms;
         if (bh_fast_plot_elapsed_ms >= BH_FAST_PLOT_PERIOD_MS) {
             bh_fast_plot_elapsed_ms = 0U;
-            float h = bh_fast_last_h;
-            float b = bh_fast_last_b;
-            commands_send_plot_points(h, b);
+            commands_send_plot_points(bh_fast_last_h, bh_fast_last_b);
+        }
+
+        bh_fast_diag_report_elapsed_ms += sleep_ms;
+        if (bh_fast_diag_report_elapsed_ms >= BH_FAST_DIAG_REPORT_MS) {
+            bh_fast_diag_report_elapsed_ms = 0U;
+            unsigned cy = bh_fast_diag_cycle;
+            if (cy != 0U && cy != bh_fast_diag_last_reported_cycle) {
+                float vs_mean = bh_fast_diag_vs_mean;
+                commands_printf("BH_FAST_CYCLE n=%u Iwrap=%+.5fA Dwrap=%+.6f Bclose=%+.7fT Bmin=%+.7fT Bmax=%+.7fT Vsmean=%+.3fuV A1mean=%+.3fmV",
+                        cy,
+                        (double)bh_fast_diag_i_wrap,
+                        (double)bh_fast_diag_duty_wrap,
+                        (double)bh_fast_diag_b_close,
+                        (double)bh_fast_diag_b_min,
+                        (double)bh_fast_diag_b_max,
+                        (double)(vs_mean * 1.0e6f),
+                        (double)(vs_mean * BH_INA_GAIN * 1.0e3f));
+                bh_fast_diag_last_reported_cycle = cy;
+            }
         }
     }
 
     chThdSleepMilliseconds(sleep_ms);
 }
 
+/* Convert the legacy normalized triangle reference into signed fixed-axis duty.
+ * Keep duty magnitude positive and reverse the voltage vector by 180 degrees on
+ * the negative half. This avoids relying on negative-duty semantics in VESC.
+ */
+static inline void bh_fast_openloop_duty_from_axis(float i_axis, float phase_unused) {
+    (void)phase_unused;
+    float denom = bh_i_pk * BH_TWO_BY_SQRT3;
+    float norm = fabsf(denom) > 1.0e-9f ? i_axis / denom : 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
+    if (norm < -1.0f) norm = -1.0f;
+
+    float signed_duty = bh_fast_duty_pk * norm;
+    float phase = BH_FOC_PHASE_DEG;
+    if (signed_duty < 0.0f) {
+        phase += 180.0f;
+    }
+    mcpwm_foc_set_openloop_duty_phase(fabsf(signed_duty), phase);
+    bh_fast_last_duty_cmd = signed_duty;
+}
+
+static void terminal_bh_live_fast_duty(int argc, const char **argv);
+
+/* hw_mini4_bh_fast.inc registers exactly one command. Intercept that registration
+ * so the existing callback slot directly receives the duty-mode parser rather
+ * than registering a second callback with the same string.
+ */
+static inline void bh_fast_register_duty_command(const char *command,
+        const char *help, const char *arg_names,
+        void(*cbf)(int argc, const char **argv)) {
+    (void)help;
+    (void)arg_names;
+    (void)cbf;
+    terminal_register_command_callback(command,
+            "Fast fixed-axis duty B-H tracer; H is measured current.",
+            "<duty_pk_0..1> <freq_Hz> <path_mm> <area_mm2>",
+            terminal_bh_live_fast_duty);
+}
+
 /* Preserve the useful full-rate phase-C A1 Sampled Data overlay while fast mode
- * owns VESC's single PWM callback. This is diagnostic-only and does not modify
- * the B-H estimator. Restore the standalone overlay when fast mode exits.
+ * owns VESC's single PWM callback. Restore it when fast mode exits.
  */
 static void bh_fast_pwm_callback(void);
 static void bh_sample_scope_pwm_cb(void);
@@ -134,11 +230,17 @@ static inline void bh_fast_restore_pwm_callback(void) {
 #define bh_apply_current(i_line) bh_fast_apply_keeper_current(i_line)
 #define mc_interface_lock() ((void)0)
 #define mc_interface_set_pwm_callback(p_func) BH_FAST_CB_DISPATCH(p_func)
+#define mcpwm_foc_set_openloop_phase(i_axis, phase) \
+        bh_fast_openloop_duty_from_axis((i_axis), (phase))
+#define terminal_register_command_callback(command, help, arg_names, cbf) \
+        bh_fast_register_duty_command((command), (help), (arg_names), (cbf))
 #undef chThdSleepMilliseconds
 #define chThdSleepMilliseconds(ms) bh_fast_worker_plot_sleep((unsigned)(ms))
 #include "hw_mini4_bh_fast.inc"
 #undef chThdSleepMilliseconds
 #define chThdSleepMilliseconds(msec) chThdSleep(MS2ST(msec))
+#undef terminal_register_command_callback
+#undef mcpwm_foc_set_openloop_phase
 #undef mc_interface_set_pwm_callback
 #undef mc_interface_lock
 #undef bh_apply_current
@@ -147,15 +249,8 @@ static inline void bh_fast_restore_pwm_callback(void) {
 #undef BH_FAST_CB_DISPATCH_0
 #undef BH_FAST_CB_DISPATCH_bh_fast_pwm_callback
 
-/* Known-good estimator architecture:
- *   - full-rate VESC FOC/current PI;
- *   - tracer work at /2 cadence;
- *   - median measured current -> H;
- *   - hard-off-zero-referenced A1 -> median -> trapezoidal B integration;
- *   - B integration restarts at every complete excitation cycle.
- *
- * No A1 LUT, rolling DC servo, phase-bin H averaging, B-center estimator or
- * analog-chain de-embedding is active in this fast path.
+/* Baseline estimator remains deliberately simple. The only additions here are
+ * passive cycle diagnostics and the duty reference hook above.
  */
 static void bh_fast_pwm_callback(void) {
     bh_sample_scope_pwm_cb();
@@ -185,6 +280,20 @@ static void bh_fast_pwm_callback(void) {
         return;
     }
 
+    if (bh_fast_have_vmed) {
+        float b = bh_fast_b;
+        bh_fast_diag_vs_sum += bh_fast_last_vmed;
+        bh_fast_diag_vs_count++;
+        if (!bh_fast_diag_have_b) {
+            bh_fast_diag_b_min_work = b;
+            bh_fast_diag_b_max_work = b;
+            bh_fast_diag_have_b = true;
+        } else {
+            if (b < bh_fast_diag_b_min_work) bh_fast_diag_b_min_work = b;
+            if (b > bh_fast_diag_b_max_work) bh_fast_diag_b_max_work = b;
+        }
+    }
+
     bh_fast_sample_n++;
     float next_phase = bh_fast_phase + bh_fast_phase_step;
     if (next_phase >= 1.0f) {
@@ -196,9 +305,22 @@ static void bh_fast_pwm_callback(void) {
         bh_fast_sample_n = 0;
         next_phase -= 1.0f;
 
-        /* Make every B-H cycle independent. This is the key behavior from the
-         * pre-regression tracer and prevents any DC integration error from
-         * accumulating into later cycles.
+        /* Snapshot immediately before the per-cycle B reset. Iwrap is the same
+         * median-current-derived quantity used for plotted H, converted to A.
+         */
+        bh_fast_diag_cycle = (unsigned)bh_fast_cycle_n;
+        bh_fast_diag_i_wrap = fabsf(bh_fast_h_scale) > 1.0e-9f ?
+                bh_fast_last_h / bh_fast_h_scale : bh_coil_current();
+        bh_fast_diag_duty_wrap = bh_fast_last_duty_cmd;
+        bh_fast_diag_b_close = bh_fast_b;
+        bh_fast_diag_b_min = bh_fast_diag_have_b ? bh_fast_diag_b_min_work : 0.0f;
+        bh_fast_diag_b_max = bh_fast_diag_have_b ? bh_fast_diag_b_max_work : 0.0f;
+        bh_fast_diag_vs_mean = bh_fast_diag_vs_count > 0U ?
+                bh_fast_diag_vs_sum / (float)bh_fast_diag_vs_count : 0.0f;
+        bh_fast_diag_reset_work();
+
+        /* Make every B-H cycle independent. Do not hide closure error by
+         * centering or feeding these diagnostics back into the integrator.
          */
         bh_fast_b = 0.0f;
         bh_fast_last_b = 0.0f;
@@ -210,6 +332,58 @@ static void bh_fast_pwm_callback(void) {
 }
 
 #include "hw_mini4_bh_worker_v2.inc"
+
+/* Duty-mode parser for the existing bh_live_fast callback slot. bh_i_pk is an
+ * internal safety surrogate only: choosing 5/1.5 A makes the legacy fast-path
+ * overcurrent formula trip at about 5 A measured line current, while duty is
+ * the actual excitation command.
+ */
+static void terminal_bh_live_fast_duty(int argc, const char **argv) {
+    if (bh_is_busy()) {
+        commands_printf("A B-H job is already running or queued. Use bh_stop first.");
+        return;
+    }
+    if (argc != 5) {
+        commands_printf("Usage: bh_live_fast <duty_pk_0..1> <freq_Hz> <path_mm> <area_mm2>");
+        commands_printf("Example: bh_live_fast 0.02 25 21.9 3.65");
+        return;
+    }
+
+    float duty_pk = strtof(argv[1], 0);
+    float freq = strtof(argv[2], 0);
+    float path_mm = strtof(argv[3], 0);
+    float area_mm2 = strtof(argv[4], 0);
+
+    if (!bh_rl_valid) {
+        commands_printf("Measure fixture R/L first with bh_measure_rl (or use bh_set_rl).");
+        return;
+    }
+    if (!(duty_pk >= 0.0f && duty_pk <= 1.0f) ||
+            !(freq >= BH_MIN_FREQ_HZ && freq <= BH_MAX_FREQ_HZ) ||
+            !(path_mm > 0.0f) || !(area_mm2 > 0.0f)) {
+        commands_printf("Limits: duty 0..1, f %.1f..%.1f Hz, geometry>0.",
+                (double)BH_MIN_FREQ_HZ, (double)BH_MAX_FREQ_HZ);
+        return;
+    }
+
+    bh_fast_duty_pk = duty_pk;
+    bh_i_pk = BH_FAST_DUTY_LINE_LIMIT_A / 1.5f;
+    bh_path_m = path_mm * 1.0e-3f;
+    bh_area_m2 = area_mm2 * 1.0e-6f;
+    bh_cycles = 1;
+    bh_freq = freq;
+    bh_fast_live_mode = true;
+    bh_live_mode = false;
+    bh_live_suppress_metric = false;
+    if (!bh_queue_job(BH_JOB_RUN)) {
+        bh_fast_live_mode = false;
+        return;
+    }
+
+    commands_printf("B-H fast duty run queued: Dpk=%.6f f=%.4f Hz path=%.3f mm area=%.4f mm^2 Iabort~%.1f A",
+            (double)duty_pk, (double)freq, (double)path_mm,
+            (double)area_mm2, (double)BH_FAST_DUTY_LINE_LIMIT_A);
+}
 
 #define bh_init_commands bh_init_commands_v2_base
 #include "hw_mini4_bh_terminal_v2.inc"
@@ -223,6 +397,8 @@ static void bh_init_commands(void) {
 #undef bh_set_measurement_gains
 #undef bh_set_run_gains
 #undef bh_release_locked
+#undef BH_FAST_DUTY_LINE_LIMIT_A
+#undef BH_FAST_DIAG_REPORT_MS
 #undef BH_FAST_PLOT_PERIOD_MS
 
 #endif /* HW_MINI4_BH_H_ */
