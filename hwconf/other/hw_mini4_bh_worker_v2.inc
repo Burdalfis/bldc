@@ -41,7 +41,7 @@ static THD_FUNCTION(bh_thread, arg) {
 		utils_sys_lock_cnt();
 		timeout_configure_IWDT_slowest();
 		utils_sys_unlock_cnt();
-		commands_printf("BH_WDT slow");
+		commands_printf("BH_WDTS");
 
 		/* The ordinary VESC command timeout is intended to stop a motor when its
 		 * command source disappears. A tracer job is itself the command source,
@@ -60,7 +60,7 @@ static THD_FUNCTION(bh_thread, arg) {
 		mc_configuration *cfg_old = mempools_alloc_mcconf();
 		mc_configuration *cfg = mempools_alloc_mcconf();
 		if (!cfg_old || !cfg) {
-			commands_printf("BH_ABORT alloc cfg");
+			commands_printf("BH_ACFG");
 			if (cfg) mempools_free_mcconf(cfg);
 			if (cfg_old) mempools_free_mcconf(cfg_old);
 			timeout_configure(timeout_old_msec, timeout_old_brake, timeout_old_ksw);
@@ -91,7 +91,7 @@ static THD_FUNCTION(bh_thread, arg) {
 			mc_interface_set_configuration(cfg);
 			bh_release_locked();
 			bh_hold_hard_off_ms(100);
-			commands_printf("BH_SETUP ready");
+			commands_printf("BH_SETUP");
 			ok = bh_measure_rl_locked(cfg, bh_rl_current, bh_rl_freq);
 		} else {
 			bh_common_cfg(cfg, bh_i_pk);
@@ -99,8 +99,8 @@ static THD_FUNCTION(bh_thread, arg) {
 			mc_interface_set_configuration(cfg);
 			bh_release_locked();
 			bh_hold_hard_off_ms(100);
-			commands_printf("BH_SETUP ready");
-			commands_printf("BH_CTRL Rline=%.6f mOhm Lline=%.6f uH Kp=%.7g Ki=%.7g BW=%.1f Hz",
+			commands_printf("BH_SETUP");
+			commands_printf("BH_CTRL R=%.6f L=%.6f Kp=%.7g Ki=%.7g BW=%.1f",
 					(double)(bh_r_line_ohm * 1e3f), (double)(bh_l_line_h * 1e6f),
 					(double)cfg->foc_current_kp, (double)cfg->foc_current_ki,
 					(double)BH_CURRENT_BW_HZ);
@@ -116,7 +116,7 @@ static THD_FUNCTION(bh_thread, arg) {
 				int step_n = 0;
 				while (!bh_stop_requested && f <= bh_fmax * 1.000001f &&
 						step_n < BH_MAX_SWEEP_POINTS) {
-					commands_printf("BH_SWEEP_STEP n=%d f=%.6f Hz", step_n, (double)f);
+					commands_printf("BH_SW n=%d f=%.6f", step_n, (double)f);
 					bh_metrics_t m;
 					ok = bh_run_one(f, true, false, &m);
 					if (!ok) {
@@ -130,7 +130,7 @@ static THD_FUNCTION(bh_thread, arg) {
 						f = bh_fmin + (float)step_n * bh_sweep_step;
 					}
 				}
-				commands_printf("BH_SWEEP_DONE points=%d%s", step_n,
+				commands_printf("BH_SW done=%d%s", step_n,
 						bh_stop_requested ? " STOPPED" : (ok ? "" : " ABORTED"));
 			}
 		}
@@ -157,10 +157,10 @@ static THD_FUNCTION(bh_thread, arg) {
 		utils_sys_lock_cnt();
 		timeout_configure_IWDT();
 		utils_sys_unlock_cnt();
-		commands_printf("BH_WDT normal");
+		commands_printf("BH_WDTN");
 
 		if (job == BH_JOB_MEASURE_RL && !ok) {
-			commands_printf("BH_RL_DONE ABORTED");
+			commands_printf("BH_RL_ABORT");
 		} else if (job == BH_JOB_RUN) {
 			commands_printf("BH_DONE%s", ok ? "" : " ABORTED");
 		}
