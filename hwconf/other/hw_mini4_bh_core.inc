@@ -13,8 +13,8 @@
 #include <string.h>
 
 // MINI4 B-H tracer fixture:
-//   Excitation winding: 20 turns, phase output 1 to phase output 2
-//   Search winding:     10 turns -> INA282 -> COMM A1 / ADC_EXT1
+//   Excitation winding: 10 turns, phase output 1 to phase output 2
+//   Search winding:      5 turns -> INA282 -> COMM A1 / ADC_EXT1
 //   INA282 gain:        50 V/V, REF1=0 V, REF2=3.3 V (about 1.65 V center)
 //
 // For an A-B two-terminal winding current I:
@@ -23,8 +23,8 @@
 // At that same fixed angle Vab = sqrt(3) * Vd, therefore the FOC d-axis
 // plant sees exactly half the physical A-B line resistance and inductance.
 
-#define BH_EXC_TURNS                 20.0f
-#define BH_SENSE_TURNS               10.0f
+#define BH_EXC_TURNS                 10.0f
+#define BH_SENSE_TURNS                5.0f
 #define BH_INA_GAIN                  50.0f
 #define BH_FOC_PHASE_DEG             (-30.0f)
 #define BH_SQRT3                     1.73205080757f
