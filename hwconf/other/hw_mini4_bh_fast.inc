@@ -1,22 +1,13 @@
-/* PWM-rate B-H live mode.
- *
- * VESC's FOC machinery continues at full rate while the MINI4 raw-SVM hook
- * supplies a fixed A-B voltage vector. A1/current acquisition, median impulse
- * rejection, H calculation and per-cycle B integration run at /2 cadence.
- */
+/* PWM-rate B-H live mode. */
 
 #define BH_FAST_OVERCURRENT_SAMPLES       1
 #define BH_FAST_HARD_CLIPS_PER_SEC        10
 #define BH_FAST_DIAG_DIV                  2U
 #define BH_FAST_A1_ZERO_SAMPLES           40U
 
-/* Actual search-input chain:
- *   91R -> (100nF || 680nF differential) -> 91R
- *       -> 100nF differential + 1uF from EACH INA input to ground
- *   INA282 Rin ~= 6k differential, BW ~= 10kHz.
- * Odd-mode half-circuit: C1=1.56uF, C2=1.20uF, Rload=3k.
- * Including the INA pole and dropping only the negligible cubic term:
- *   H(s)=G0/(1+A*s+B*s^2)
+/* Actual search chain: 91R, 780nF diff, 91R, 100nF diff + 1uF/input,
+ * INA282 Rin ~= 6k diff and BW ~= 10kHz. Odd mode: C1=1.56uF,
+ * C2=1.20uF, Rload=3k. H(s)=G0/(1+A*s+B*s^2), cubic term omitted.
  */
 #define BH_FAST_A1_INV_GAIN       1.0606666667f
 #define BH_FAST_A1_INV_A_S        0.000359723904f
@@ -57,12 +48,17 @@ static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 
+/* Plot-only origin, derived from corrected extrema of the previous cycle. */
 static unsigned bh_fast_center_cycle_seen = 0U;
 static float bh_fast_display_b_center = 0.0f;
+static float bh_fast_bc_min = 0.0f;
+static float bh_fast_bc_max = 0.0f;
+static bool bh_fast_bc_have = false;
 
 static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
 static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
 static int bh_fast_hist_n = 0;
+/* bh_fast_b and bh_fast_last_vmed remain RAW for cycle diagnostics. */
 static float bh_fast_b = 0.0f;
 static float bh_fast_last_vmed = 0.0f;
 static bool bh_fast_have_vmed = false;
@@ -70,15 +66,16 @@ static float bh_fast_last_good_vs = 0.0f;
 static int bh_fast_clip_window_samples = 0;
 static int bh_fast_clip_window_events = 0;
 
-/* Inverse-filter state. v1/v2 are median-filtered measured search voltage.
- * The direct A1 inverse needs dV/dt and d2V/dt2, so do it only after the
- * three-sample median. The same corrected voltage is integrated into B and is
- * exposed on Sampled Data phase C as an INA-output-equivalent voltage.
+/* Shared inverse-filter history. Direct voltage inversion is used only for the
+ * phase-C scope diagnostic. B plotting uses the better-conditioned B-domain
+ * inverse: Btrue=(Bm + A*V/(NA) + B*dV/dt/(NA))/G0.
  */
 static float bh_fast_de_v1 = 0.0f;
 static float bh_fast_de_v2 = 0.0f;
 static float bh_fast_de_k1 = 0.0f;
 static float bh_fast_de_k2 = 0.0f;
+static float bh_fast_de_bv = 0.0f;
+static float bh_fast_de_bd = 0.0f;
 static unsigned bh_fast_de_n = 0U;
 static volatile float bh_fast_scope_a1_v = 0.0f;
 
@@ -95,6 +92,7 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	return b;
 }
 
+/* Deliberately aggressive direct inverse for Sampled Data only. */
 static inline float bh_fast_deembed_vs(float v) {
 	float out = v;
 	if (bh_fast_de_n == 1U) {
@@ -112,7 +110,6 @@ static inline float bh_fast_deembed_vs(float v) {
 	return out;
 }
 
-/* -1..+1 triangle directly scales A-B line duty. */
 static inline void bh_fast_set_current_ref(float i_line) {
 	float i_axis = i_line * BH_TWO_BY_SQRT3;
 	mcpwm_foc_set_openloop_phase(i_axis, BH_FOC_PHASE_DEG);
@@ -204,9 +201,13 @@ static inline bool bh_fast_acquire_sample(void) {
 			bh_fast_ihist[0], bh_fast_ihist[1], bh_fast_ihist[2]);
 	float vmed = bh_fast_median3(
 			bh_fast_vhist[0], bh_fast_vhist[1], bh_fast_vhist[2]);
-	vmed = bh_fast_deembed_vs(vmed);
-	bh_fast_scope_a1_v = fabsf(bh_fast_vs_scale) > 1.0e-9f ?
-			vmed / bh_fast_vs_scale : 0.0f;
+
+	/* Snapshot history before the scope-only direct inverse advances it. */
+	float pv1 = bh_fast_de_v1;
+	float pv2 = bh_fast_de_v2;
+	unsigned pn = bh_fast_de_n;
+	float vscope = bh_fast_deembed_vs(vmed);
+	bh_fast_scope_a1_v = vscope * BH_INA_GAIN;
 
 	if (imed > bh_fast_cycle_i_max) bh_fast_cycle_i_max = imed;
 	if (imed < bh_fast_cycle_i_min) bh_fast_cycle_i_min = imed;
@@ -222,27 +223,54 @@ static inline bool bh_fast_acquire_sample(void) {
 		bh_fast_overcurrent_count = 0;
 	}
 
+	/* Integrate the measured, median-filtered voltage. Raw closure diagnostics
+	 * therefore stay raw and cannot be hidden by the analog inverse.
+	 */
 	if (bh_fast_have_vmed) {
 		bh_fast_b += (bh_fast_last_vmed + vmed) * bh_fast_b_step_scale;
 	}
 	bh_fast_last_vmed = vmed;
 	bh_fast_have_vmed = true;
 
+	/* B-domain inverse needs only dV/dt, not d2V/dt2. */
+	float bc = bh_fast_b + bh_fast_de_bv * vmed;
+	if (pn == 1U) {
+		bc += 2.0f * bh_fast_de_bd * (vmed - pv1);
+	} else if (pn >= 2U) {
+		bc += bh_fast_de_bd *
+				(3.0f * vmed - 4.0f * pv1 + pv2);
+	}
+	bc *= BH_FAST_A1_INV_GAIN;
+
+	/* At the first sample of a new cycle, center it using corrected extrema from
+	 * the completed cycle. The center then stays fixed for the whole cycle.
+	 */
 	if (bh_fast_diag_cycle != bh_fast_center_cycle_seen) {
 		bh_fast_center_cycle_seen = bh_fast_diag_cycle;
-		bh_fast_display_b_center = 0.5f *
-				(bh_fast_diag_b_min + bh_fast_diag_b_max);
+		if (bh_fast_bc_have) {
+			bh_fast_display_b_center = 0.5f *
+					(bh_fast_bc_min + bh_fast_bc_max);
+		}
+		bh_fast_bc_have = false;
+	}
+	if (!bh_fast_bc_have) {
+		bh_fast_bc_min = bc;
+		bh_fast_bc_max = bc;
+		bh_fast_bc_have = true;
+	} else {
+		if (bc < bh_fast_bc_min) bh_fast_bc_min = bc;
+		if (bc > bh_fast_bc_max) bh_fast_bc_max = bc;
 	}
 
 	bh_fast_last_h = imed * bh_fast_h_scale;
-	bh_fast_last_b = bh_fast_b - bh_fast_display_b_center;
+	bh_fast_last_b = bc - bh_fast_display_b_center;
 	return true;
 }
 
 static bool bh_fast_install_tight_current_limits(void) {
 	mc_configuration *cfg = mempools_alloc_mcconf();
 	if (!cfg) {
-		commands_printf("BH_FAST_ABORT alloc limits");
+		commands_printf("BH_FAST_ABORT alloc");
 		return false;
 	}
 	*cfg = *mc_interface_get_configuration();
@@ -279,6 +307,9 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_diag_div_count = 0U;
 	bh_fast_center_cycle_seen = 0U;
 	bh_fast_display_b_center = 0.0f;
+	bh_fast_bc_min = 0.0f;
+	bh_fast_bc_max = 0.0f;
+	bh_fast_bc_have = false;
 	bh_fast_sense_zero = sense_zero;
 	bh_fast_hist_n = 0;
 	bh_fast_b = 0.0f;
@@ -307,6 +338,10 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 			(BH_SENSE_TURNS * bh_area_m2);
 	bh_fast_de_k1 = BH_FAST_A1_INV_A_S / (2.0f * bh_fast_dt);
 	bh_fast_de_k2 = BH_FAST_A1_INV_B_S2 / (bh_fast_dt * bh_fast_dt);
+	float inv_na = 2.0f * bh_fast_b_step_scale / bh_fast_dt;
+	bh_fast_de_bv = BH_FAST_A1_INV_A_S * inv_na;
+	bh_fast_de_bd = BH_FAST_A1_INV_B_S2 * inv_na /
+			(2.0f * bh_fast_dt);
 	bh_fast_clip_window_limit = (int)(bh_fast_update_hz + 0.5f);
 	if (bh_fast_clip_window_limit < 1) bh_fast_clip_window_limit = 1;
 }
@@ -327,7 +362,7 @@ static bool bh_fast_live_plot(float freq) {
 
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
-		commands_printf("BH_FAST_ABORT FOC start");
+		commands_printf("BH_FAST_ABORT FOC");
 		bh_release_locked();
 		return false;
 	}
@@ -336,7 +371,7 @@ static bool bh_fast_live_plot(float freq) {
 	float active_zero = 0.0f;
 	float zero_i = 0.0f;
 	if (!bh_fast_measure_active_zero(&active_zero, &zero_i)) {
-		commands_printf("BH_FAST_ABORT A1 pwm zero");
+		commands_printf("BH_FAST_ABORT A1zeroPWM");
 		bh_fast_set_current_ref(0.0f);
 		bh_release_locked();
 		bh_foc_svm_override_active = false;
@@ -366,7 +401,7 @@ static bool bh_fast_live_plot(float freq) {
 
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
-			commands_printf("BH_FAST_STAT D=%+.5f Iamp=%.4f Ic=%+.4f H=%+.1f B=%+.6f clips=%u",
+			commands_printf("BH_FS D=%+.5f Ia=%.4f Ic=%+.4f H=%+.1f B=%+.6f c=%u",
 					(double)bh_fast_last_duty_cmd,
 					(double)bh_fast_last_amp,
 					(double)bh_fast_last_center,
@@ -383,11 +418,11 @@ static bool bh_fast_live_plot(float freq) {
 	bh_foc_svm_override_active = false;
 
 	if (bh_fast_clip_abort) {
-		commands_printf("BH_FAST_DONE A1 clips");
+		commands_printf("BH_FAST_DONE clips");
 		return false;
 	}
 	if (bh_fast_overcurrent_abort) {
-		commands_printf("BH_FAST_DONE overcurrent");
+		commands_printf("BH_FAST_DONE OC");
 		return false;
 	}
 	commands_printf("BH_FAST_DONE %s",
@@ -397,11 +432,11 @@ static bool bh_fast_live_plot(float freq) {
 
 static void terminal_bh_live_fast(int argc, const char **argv) {
 	if (bh_is_busy()) {
-		commands_printf("A B-H job is already running or queued. Use bh_stop first.");
+		commands_printf("BH busy");
 		return;
 	}
 	if (argc != 5) {
-		commands_printf("Usage: bh_live_fast <Ipk_A> <freq_Hz> <path_mm> <area_mm2>");
+		commands_printf("Use bh_live_fast D f path area");
 		return;
 	}
 	float i_pk = strtof(argv[1], 0);
