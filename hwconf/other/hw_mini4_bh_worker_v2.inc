@@ -41,7 +41,7 @@ static THD_FUNCTION(bh_thread, arg) {
 		utils_sys_lock_cnt();
 		timeout_configure_IWDT_slowest();
 		utils_sys_unlock_cnt();
-		commands_printf("BH_WDT slow mode active for tracer job");
+		commands_printf("BH_WDT slow");
 
 		/* The ordinary VESC command timeout is intended to stop a motor when its
 		 * command source disappears. A tracer job is itself the command source,
@@ -60,7 +60,7 @@ static THD_FUNCTION(bh_thread, arg) {
 		mc_configuration *cfg_old = mempools_alloc_mcconf();
 		mc_configuration *cfg = mempools_alloc_mcconf();
 		if (!cfg_old || !cfg) {
-			commands_printf("BH_ABORT could not allocate motor configuration");
+			commands_printf("BH_ABORT alloc cfg");
 			if (cfg) mempools_free_mcconf(cfg);
 			if (cfg_old) mempools_free_mcconf(cfg_old);
 			timeout_configure(timeout_old_msec, timeout_old_brake, timeout_old_ksw);
@@ -91,7 +91,7 @@ static THD_FUNCTION(bh_thread, arg) {
 			mc_interface_set_configuration(cfg);
 			bh_release_locked();
 			bh_hold_hard_off_ms(100);
-			commands_printf("BH_SETUP locked/off; tracer config settled");
+			commands_printf("BH_SETUP ready");
 			ok = bh_measure_rl_locked(cfg, bh_rl_current, bh_rl_freq);
 		} else {
 			bh_common_cfg(cfg, bh_i_pk);
@@ -99,7 +99,7 @@ static THD_FUNCTION(bh_thread, arg) {
 			mc_interface_set_configuration(cfg);
 			bh_release_locked();
 			bh_hold_hard_off_ms(100);
-			commands_printf("BH_SETUP locked/off; tracer config settled");
+			commands_printf("BH_SETUP ready");
 			commands_printf("BH_CTRL Rline=%.6f mOhm Lline=%.6f uH Kp=%.7g Ki=%.7g BW=%.1f Hz",
 					(double)(bh_r_line_ohm * 1e3f), (double)(bh_l_line_h * 1e6f),
 					(double)cfg->foc_current_kp, (double)cfg->foc_current_ki,
@@ -157,7 +157,7 @@ static THD_FUNCTION(bh_thread, arg) {
 		utils_sys_lock_cnt();
 		timeout_configure_IWDT();
 		utils_sys_unlock_cnt();
-		commands_printf("BH_WDT normal mode restored");
+		commands_printf("BH_WDT normal");
 
 		if (job == BH_JOB_MEASURE_RL && !ok) {
 			commands_printf("BH_RL_DONE ABORTED");
