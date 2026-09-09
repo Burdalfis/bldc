@@ -1,17 +1,15 @@
 /* PWM-rate current-controlled B-H live mode.
  *
- * VESC's FOC/current PI continues at full rate while the extra tracer work runs
- * at a decimated cadence. INA282/current acquisition, median impulse rejection,
- * H calculation and B integration run at that tracer cadence; Experiment Plot
- * transport is paced from the worker thread by hw_mini4_bh.h.
+ * CPU diagnostic variant: VESC's FOC/current PI continues at full rate while
+ * the extra tracer work runs at a decimated cadence. INA282/current acquisition,
+ * median impulse rejection, H calculation and B integration are restored here;
+ * Experiment Plot transport remains disabled so acquisition cost can be measured
+ * independently from USB/plot cost.
  */
 
 #define BH_FAST_OVERCURRENT_SAMPLES       4
 #define BH_FAST_HARD_CLIPS_PER_SEC        10
 #define BH_FAST_DIAG_DIV                  2U
-#define BH_FAST_A1_BIAS_CYCLES            16U
-#define BH_FAST_H_PHASE_BINS              64U
-#define BH_FAST_H_PHASE_ALPHA             0.125f
 
 /* foc_math.h still contains the MINI4 raw-SVM hook from the old voltage-drive
  * prototype. Keep its linkage satisfied but leave it permanently disabled.
@@ -52,45 +50,18 @@ static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 
-/* Decimated acquisition/filter state. The three-sample medians reject isolated
- * current/A1 spikes before either signal is used for plotting/integration.
+/* Decimated acquisition/filter state. No cycle buffers are allocated in this
+ * diagnostic build because MINI4's RAM4 region has almost no spare capacity.
  */
 static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
 static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
 static int bh_fast_hist_n = 0;
 static float bh_fast_b = 0.0f;
 static float bh_fast_last_vmed = 0.0f;
-static float bh_fast_last_vmed_raw = 0.0f;
 static bool bh_fast_have_vmed = false;
 static float bh_fast_last_good_vs = 0.0f;
 static int bh_fast_clip_window_samples = 0;
 static int bh_fast_clip_window_events = 0;
-
-/* After hard-off zero and the current-indexed A1 LUT are removed, any remaining
- * mean search voltage over a complete settled magnetic cycle is DC error: true
- * search-coil volt-seconds must close over a periodic B-H loop. Track that mean
- * over 16 complete cycles and subtract it before integration. Values here are
- * search-winding volts (already divided by INA gain), not INA output volts.
- */
-static float bh_fast_vs_bias = 0.0f;
-static float bh_fast_cycle_vs_sum = 0.0f;
-static unsigned bh_fast_cycle_vs_count = 0U;
-static float bh_fast_vs_bias_hist[BH_FAST_A1_BIAS_CYCLES] = {0.0f};
-static float bh_fast_vs_bias_hist_sum = 0.0f;
-static unsigned bh_fast_vs_bias_hist_count = 0U;
-static unsigned bh_fast_vs_bias_hist_next = 0U;
-
-/* Plot-only current smoothing. Accumulate measured median current in 64 phase
- * bins for one complete excitation cycle. At the boundary, each bin's cycle
- * average updates an ~8-cycle EMA. H is interpolated between the learned phase
- * bins, so noise is averaged across repeated cycles without the temporal phase
- * lag of an ordinary moving-average/low-pass filter. Raw measured current still
- * drives protection, LUT correction and amplitude statistics.
- */
-static float bh_fast_h_phase_cycle_sum[BH_FAST_H_PHASE_BINS] = {0.0f};
-static uint16_t bh_fast_h_phase_cycle_count[BH_FAST_H_PHASE_BINS] = {0};
-static float bh_fast_h_phase_profile[BH_FAST_H_PHASE_BINS] = {0.0f};
-static uint8_t bh_fast_h_phase_valid[BH_FAST_H_PHASE_BINS] = {0};
 
 static inline float bh_fast_triangle(float p) {
 	if (p < 0.25f) {
@@ -106,77 +77,6 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	if (b > c) { float t = b; b = c; c = t; }
 	if (a > b) { float t = a; a = b; b = t; }
 	return b;
-}
-
-static inline unsigned bh_fast_h_phase_bin(float phase) {
-	unsigned bin = (unsigned)(phase * (float)BH_FAST_H_PHASE_BINS);
-	if (bin >= BH_FAST_H_PHASE_BINS) {
-		bin = BH_FAST_H_PHASE_BINS - 1U;
-	}
-	return bin;
-}
-
-static inline void bh_fast_h_phase_accumulate(float phase, float i_line) {
-	unsigned bin = bh_fast_h_phase_bin(phase);
-	bh_fast_h_phase_cycle_sum[bin] += i_line;
-	if (bh_fast_h_phase_cycle_count[bin] < 65535U) {
-		bh_fast_h_phase_cycle_count[bin]++;
-	}
-}
-
-static inline void bh_fast_h_phase_commit_cycle(void) {
-	for (unsigned bin = 0U; bin < BH_FAST_H_PHASE_BINS; bin++) {
-		uint16_t count = bh_fast_h_phase_cycle_count[bin];
-		if (count > 0U) {
-			float avg = bh_fast_h_phase_cycle_sum[bin] / (float)count;
-			if (bh_fast_h_phase_valid[bin]) {
-				bh_fast_h_phase_profile[bin] += BH_FAST_H_PHASE_ALPHA *
-						(avg - bh_fast_h_phase_profile[bin]);
-			} else {
-				bh_fast_h_phase_profile[bin] = avg;
-				bh_fast_h_phase_valid[bin] = 1U;
-			}
-		}
-		bh_fast_h_phase_cycle_sum[bin] = 0.0f;
-		bh_fast_h_phase_cycle_count[bin] = 0U;
-	}
-}
-
-static inline float bh_fast_h_phase_smoothed(float phase, float fallback) {
-	/* Profile samples represent bin centers. Interpolate across the circular
-	 * profile so binning itself does not add visible horizontal quantization.
-	 */
-	float x = phase * (float)BH_FAST_H_PHASE_BINS - 0.5f;
-	unsigned i0;
-	float frac;
-	if (x < 0.0f) {
-		i0 = BH_FAST_H_PHASE_BINS - 1U;
-		frac = x + 1.0f;
-	} else {
-		i0 = (unsigned)x;
-		if (i0 >= BH_FAST_H_PHASE_BINS) {
-			i0 = BH_FAST_H_PHASE_BINS - 1U;
-		}
-		frac = x - (float)i0;
-	}
-	unsigned i1 = i0 + 1U;
-	if (i1 >= BH_FAST_H_PHASE_BINS) {
-		i1 = 0U;
-	}
-
-	bool v0 = bh_fast_h_phase_valid[i0] != 0U;
-	bool v1 = bh_fast_h_phase_valid[i1] != 0U;
-	if (v0 && v1) {
-		return bh_fast_h_phase_profile[i0] + frac *
-				(bh_fast_h_phase_profile[i1] - bh_fast_h_phase_profile[i0]);
-	}
-	if (v0) {
-		return bh_fast_h_phase_profile[i0];
-	}
-	if (v1) {
-		return bh_fast_h_phase_profile[i1];
-	}
-	return fallback;
 }
 
 /* Update the ordinary FOC d-axis current target. Fixed A-B geometry:
@@ -199,13 +99,7 @@ static inline void bh_fast_abort_drive(void) {
 }
 
 /* One tracer-rate acquisition step. Geometry and INA scaling are precomputed
- * in bh_fast_reset_state(), so this hot path contains no geometry division.
- *
- * bh_measure_rl builds an 11-point active-PWM feedthrough LUT versus measured
- * coil current. At settled DC excitation the true search-coil voltage is zero,
- * so the LUT directly represents current-correlated A1 contamination without
- * importing Vd's L*dI/dt term into the live correction. The raw A1 Sampled Data
- * overlay stays uncorrected so the physical contamination remains visible.
+ * in bh_fast_reset_state(), so this hot path contains no floating-point divide.
  */
 static inline bool bh_fast_acquire_sample(void) {
 	float i_now = bh_coil_current();
@@ -227,22 +121,15 @@ static inline bool bh_fast_acquire_sample(void) {
 		bh_fast_clip_window_events = 0;
 	}
 
-	/* vhist stays in the pre-DC-servo reference. That lets the rolling bias move
-	 * at cycle boundaries without having to rewrite the median history.
-	 */
-	float vs_raw = bh_fast_last_good_vs;
+	float vs = bh_fast_last_good_vs;
 	if (!hard) {
-		float vout = bh_sense_out_v() - bh_fast_sense_zero;
-		if (bh_sense_pwm_lut_valid) {
-			vout -= bh_sense_pwm_lut_error_v(i_now);
-		}
-		vs_raw = vout * bh_fast_vs_scale;
-		bh_fast_last_good_vs = vs_raw;
+		vs = (bh_sense_out_v() - bh_fast_sense_zero) * bh_fast_vs_scale;
+		bh_fast_last_good_vs = vs;
 	}
 
 	bh_fast_vhist[0] = bh_fast_vhist[1];
 	bh_fast_vhist[1] = bh_fast_vhist[2];
-	bh_fast_vhist[2] = vs_raw;
+	bh_fast_vhist[2] = vs;
 	bh_fast_ihist[0] = bh_fast_ihist[1];
 	bh_fast_ihist[1] = bh_fast_ihist[2];
 	bh_fast_ihist[2] = i_now;
@@ -253,9 +140,8 @@ static inline bool bh_fast_acquire_sample(void) {
 
 	float imed = bh_fast_median3(
 			bh_fast_ihist[0], bh_fast_ihist[1], bh_fast_ihist[2]);
-	float vmed_raw = bh_fast_median3(
+	float vmed = bh_fast_median3(
 			bh_fast_vhist[0], bh_fast_vhist[1], bh_fast_vhist[2]);
-	float vmed = vmed_raw - bh_fast_vs_bias;
 
 	if (imed > bh_fast_cycle_i_max) bh_fast_cycle_i_max = imed;
 	if (imed < bh_fast_cycle_i_min) bh_fast_cycle_i_min = imed;
@@ -271,19 +157,13 @@ static inline bool bh_fast_acquire_sample(void) {
 		bh_fast_overcurrent_count = 0;
 	}
 
-	bh_fast_h_phase_accumulate(bh_fast_phase, imed);
-	float i_plot = bh_fast_h_phase_smoothed(bh_fast_phase, imed);
-
 	if (bh_fast_have_vmed) {
 		bh_fast_b += (bh_fast_last_vmed + vmed) * bh_fast_b_step_scale;
 	}
-	bh_fast_last_vmed_raw = vmed_raw;
 	bh_fast_last_vmed = vmed;
 	bh_fast_have_vmed = true;
-	bh_fast_last_h = i_plot * bh_fast_h_scale;
-	/* bh_fast_last_b is published only by the outer callback after RC
-	 * de-embedding, avoiding a worker-visible raw/de-embedded race.
-	 */
+	bh_fast_last_h = imed * bh_fast_h_scale;
+	bh_fast_last_b = bh_fast_b;
 	return true;
 }
 
@@ -330,26 +210,12 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_hist_n = 0;
 	bh_fast_b = 0.0f;
 	bh_fast_last_vmed = 0.0f;
-	bh_fast_last_vmed_raw = 0.0f;
 	bh_fast_have_vmed = false;
 	bh_fast_last_good_vs = 0.0f;
 	bh_fast_clip_window_samples = 0;
 	bh_fast_clip_window_events = 0;
 	memset(bh_fast_vhist, 0, sizeof(bh_fast_vhist));
 	memset(bh_fast_ihist, 0, sizeof(bh_fast_ihist));
-
-	bh_fast_vs_bias = 0.0f;
-	bh_fast_cycle_vs_sum = 0.0f;
-	bh_fast_cycle_vs_count = 0U;
-	memset(bh_fast_vs_bias_hist, 0, sizeof(bh_fast_vs_bias_hist));
-	bh_fast_vs_bias_hist_sum = 0.0f;
-	bh_fast_vs_bias_hist_count = 0U;
-	bh_fast_vs_bias_hist_next = 0U;
-
-	memset(bh_fast_h_phase_cycle_sum, 0, sizeof(bh_fast_h_phase_cycle_sum));
-	memset(bh_fast_h_phase_cycle_count, 0, sizeof(bh_fast_h_phase_cycle_count));
-	memset(bh_fast_h_phase_profile, 0, sizeof(bh_fast_h_phase_profile));
-	memset(bh_fast_h_phase_valid, 0, sizeof(bh_fast_h_phase_valid));
 
 	bh_fast_fs = mc_interface_get_sampling_frequency_now();
 	if (bh_fast_fs < 1000.0f) {
@@ -390,15 +256,7 @@ static bool bh_fast_live_plot(float freq) {
 			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)sense_zero, bh_sense_polarity);
-	if (bh_sense_pwm_lut_valid) {
-		commands_printf("BH_FAST_A1_COMP LUT enabled points=%d I=[%+.6f,%+.6f] A",
-				BH_A1_PWM_LUT_POINTS,
-				(double)bh_sense_pwm_i_lut[0],
-				(double)bh_sense_pwm_i_lut[BH_A1_PWM_LUT_POINTS - 1]);
-	} else {
-		commands_printf("BH_FAST_A1_COMP disabled; run bh_measure_rl to build nonlinear I/A1 feedthrough LUT");
-	}
-	commands_printf("BH_FAST: /%u current reference/acquisition, rolling A1-DC and B centering, phase-synchronous H averaging, RC de-embedding, worker plot transport.",
+	commands_printf("BH_FAST CPU diagnostic: /%u current reference plus INA282/current median, H and B integration; plot transport disabled.",
 			(unsigned)BH_FAST_DIAG_DIV);
 
 	/* Enter RUNNING gently before installing the callback. hw_mini4_bh.h maps
@@ -432,12 +290,10 @@ static bool bh_fast_live_plot(float freq) {
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
 			float track = bh_i_pk > 0.001f ? 100.0f * bh_fast_last_amp / bh_i_pk : 0.0f;
-			float a1_dc_mv = bh_fast_vs_bias * BH_INA_GAIN * 1e3f;
-			commands_printf("BH_FAST_STAT Iamp=%.5f A track=%.2f%% Icenter=%+.5f A Iref=%+.5f A H=%+.2f A/m B=%+.7f T A1dc=%+.3f mV Id=%+.5f A Vd=%+.5f V duty=%+.5f clips=%u",
+			commands_printf("BH_FAST_STAT Iamp=%.5f A track=%.2f%% Icenter=%+.5f A Iref=%+.5f A H=%+.2f A/m B=%+.7f T Id=%+.5f A Vd=%+.5f V duty=%+.5f clips=%u",
 					(double)bh_fast_last_amp, (double)track,
 					(double)bh_fast_last_center, (double)bh_fast_last_iref,
 					(double)bh_fast_last_h, (double)bh_fast_last_b,
-					(double)a1_dc_mv,
 					(double)mcpwm_foc_get_id(), (double)mcpwm_foc_get_vd(),
 					(double)mc_interface_get_duty_cycle_now(),
 					(unsigned)bh_fast_hard_clips);
