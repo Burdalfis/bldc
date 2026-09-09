@@ -79,10 +79,9 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	return b;
 }
 
-/* The legacy normalized triangle is now used only for its sign. Positive sign
- * commands +Dpk across A-B and negative sign commands -Dpk. A bipolar square
- * voltage produces the approximately triangular winding-current/H sweep wanted
- * for this fixture.
+/* The existing -1..+1 triangle now directly scales A-B line duty. With this
+ * fixture R dominates X_L over the frequencies of interest, so triangular
+ * voltage gives a much smoother H sweep than bipolar square voltage.
  *
  * For signed A-B line duty D = Vab/Vbus, the alpha/beta vector
  *   alpha = D/2
@@ -98,12 +97,10 @@ static inline void bh_fast_set_current_ref(float i_line) {
 	float i_axis = i_line * BH_TWO_BY_SQRT3;
 	mcpwm_foc_set_openloop_phase(i_axis, BH_FOC_PHASE_DEG);
 
-	float signed_duty = 0.0f;
-	if (i_line > 1.0e-6f) {
-		signed_duty = bh_fast_duty_pk;
-	} else if (i_line < -1.0e-6f) {
-		signed_duty = -bh_fast_duty_pk;
-	}
+	float norm = fabsf(bh_i_pk) > 1.0e-9f ? i_line / bh_i_pk : 0.0f;
+	if (norm > 1.0f) norm = 1.0f;
+	if (norm < -1.0f) norm = -1.0f;
+	float signed_duty = bh_fast_duty_pk * norm;
 
 	bh_foc_svm_override_alpha = 0.5f * signed_duty;
 	bh_foc_svm_override_beta = -0.288675134595f * signed_duty;
