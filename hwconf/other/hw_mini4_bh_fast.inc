@@ -1,15 +1,14 @@
 /* PWM-rate current-controlled B-H live mode.
  *
- * CPU diagnostic variant: VESC's FOC/current PI continues at full rate while
- * the extra tracer work runs at a decimated cadence. INA282/current acquisition,
- * median impulse rejection, H calculation and B integration are restored here;
- * Experiment Plot transport remains disabled so acquisition cost can be measured
- * independently from USB/plot cost.
+ * VESC's FOC/current PI continues at full rate while the extra tracer work runs
+ * at a decimated cadence. A1/current acquisition, median impulse rejection, H
+ * calculation and per-cycle B integration run at that tracer cadence.
  */
 
 #define BH_FAST_OVERCURRENT_SAMPLES       4
 #define BH_FAST_HARD_CLIPS_PER_SEC        10
 #define BH_FAST_DIAG_DIV                  2U
+#define BH_FAST_A1_ZERO_SAMPLES           40U
 
 /* foc_math.h still contains the MINI4 raw-SVM hook from the old voltage-drive
  * prototype. Keep its linkage satisfied but leave it permanently disabled.
@@ -50,8 +49,8 @@ static float bh_fast_cycle_i_max = -1.0e30f;
 static float bh_fast_cycle_i_min = 1.0e30f;
 static int bh_fast_overcurrent_count = 0;
 
-/* Decimated acquisition/filter state. No cycle buffers are allocated in this
- * diagnostic build because MINI4's RAM4 region has almost no spare capacity.
+/* Decimated acquisition/filter state. Keep the known-good three-sample median
+ * path and restart B integration at every excitation-cycle boundary.
  */
 static float bh_fast_vhist[3] = {0.0f, 0.0f, 0.0f};
 static float bh_fast_ihist[3] = {0.0f, 0.0f, 0.0f};
@@ -80,12 +79,7 @@ static inline float bh_fast_median3(float a, float b, float c) {
 }
 
 /* Update the ordinary FOC d-axis current target. Fixed A-B geometry:
- *
- *     Ia = +Iline, Ib = -Iline, Ic = 0
- *     Id = 2/sqrt(3) * Iline.
- *
- * VESC remains responsible for the full-rate current PI, SVM, deadtime,
- * current-sample placement, hardware current limits and gate timing.
+ * Ia=+Iline, Ib=-Iline, Ic=0, Id=2/sqrt(3)*Iline.
  */
 static inline void bh_fast_set_current_ref(float i_line) {
 	float i_axis = i_line * BH_TWO_BY_SQRT3;
@@ -98,8 +92,46 @@ static inline void bh_fast_abort_drive(void) {
 	bh_fast_active = false;
 }
 
-/* One tracer-rate acquisition step. Geometry and INA scaling are precomputed
- * in bh_fast_reset_state(), so this hot path contains no floating-point divide.
+/* Measure the actual A1 baseline with FOC/PWM running at zero commanded coil
+ * current. If an R/L calibration LUT exists, remove its tiny current-dependent
+ * contribution sample-by-sample so this remains a true zero-current baseline.
+ */
+static bool bh_fast_measure_active_zero(float *zero_v, float *i_avg) {
+	bh_fast_set_current_ref(0.0f);
+	chThdSleepMicroseconds(12000);
+
+	float vsum = 0.0f;
+	float isum = 0.0f;
+	for (unsigned n = 0U; n < BH_FAST_A1_ZERO_SAMPLES; n++) {
+		timeout_reset();
+		if (mc_interface_get_state() != MC_STATE_RUNNING ||
+				mc_interface_get_fault() != FAULT_CODE_NONE) {
+			return false;
+		}
+		uint16_t raw = ADC_Value[ADC_IND_EXT];
+		if (bh_adc_sample_hard_rail(raw)) {
+			return false;
+		}
+
+		float i_now = bh_coil_current();
+		float a1 = bh_sense_out_v();
+		if (bh_sense_pwm_lut_valid) {
+			a1 -= bh_sense_pwm_lut_error_v(i_now);
+		}
+		vsum += a1;
+		isum += i_now;
+		chThdSleepMicroseconds(250);
+	}
+
+	*zero_v = vsum / (float)BH_FAST_A1_ZERO_SAMPLES;
+	*i_avg = isum / (float)BH_FAST_A1_ZERO_SAMPLES;
+	return isfinite(*zero_v) && *zero_v > 0.1f && *zero_v < 3.2f &&
+			isfinite(*i_avg) && fabsf(*i_avg) < 0.25f;
+}
+
+/* One tracer-rate acquisition step. The live A1 model is intentionally static:
+ * active-PWM zero + the current-dependent LUT measured by bh_measure_rl.
+ * No rolling A1/B estimator is present in this baseline architecture.
  */
 static inline bool bh_fast_acquire_sample(void) {
 	float i_now = bh_coil_current();
@@ -123,7 +155,11 @@ static inline bool bh_fast_acquire_sample(void) {
 
 	float vs = bh_fast_last_good_vs;
 	if (!hard) {
-		vs = (bh_sense_out_v() - bh_fast_sense_zero) * bh_fast_vs_scale;
+		float vout = bh_sense_out_v() - bh_fast_sense_zero;
+		if (bh_sense_pwm_lut_valid) {
+			vout -= bh_sense_pwm_lut_error_v(i_now);
+		}
+		vs = vout * bh_fast_vs_scale;
 		bh_fast_last_good_vs = vs;
 	}
 
@@ -226,9 +262,6 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 	bh_fast_phase_step = freq / bh_fast_update_hz;
 	bh_fast_oc_lim = fmaxf(bh_i_pk * 1.50f, bh_i_pk + 0.75f);
 
-	/* All expensive geometry/sense divisions are startup-only. The 0.5 factor
-	 * is folded into the trapezoidal B integration scale as well.
-	 */
 	bh_fast_vs_scale = 1.0f / BH_INA_GAIN;
 	bh_fast_h_scale = BH_EXC_TURNS / bh_path_m;
 	bh_fast_b_step_scale = 0.5f * bh_fast_dt /
@@ -240,27 +273,25 @@ static void bh_fast_reset_state(float freq, float sense_zero) {
 }
 
 static bool bh_fast_live_plot(float freq) {
-	float sense_zero = bh_measure_sense_zero();
+	float hardoff_zero = bh_measure_sense_zero();
 	if (!bh_sense_zero_ok) {
-		commands_printf("BH_FAST_ABORT A1 zero invalid V=%.6f", (double)sense_zero);
+		commands_printf("BH_FAST_ABORT A1 off-zero invalid V=%.6f", (double)hardoff_zero);
 		return false;
 	}
 
 	if (!bh_fast_install_tight_current_limits()) {
 		return false;
 	}
-	bh_fast_reset_state(freq, sense_zero);
+	bh_fast_reset_state(freq, hardoff_zero);
 
-	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz foc_fs=%.1f Hz tracer_fs=%.1f Hz div=%u turns=%g/%g zero=%.7f V sense=%+d",
+	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz foc_fs=%.1f Hz tracer_fs=%.1f Hz div=%u turns=%g/%g offzero=%.7f V sense=%+d",
 			(double)bh_i_pk, (double)freq, (double)bh_fast_fs,
 			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
-			(double)sense_zero, bh_sense_polarity);
-	commands_printf("BH_FAST CPU diagnostic: /%u current reference plus INA282/current median, H and B integration; plot transport disabled.",
-			(unsigned)BH_FAST_DIAG_DIV);
+			(double)hardoff_zero, bh_sense_polarity);
 
-	/* Enter RUNNING gently before installing the callback. hw_mini4_bh.h maps
-	 * this startup-only zero command to a harmless 10 mA keeper current.
+	/* Enter RUNNING gently with the existing 10 mA keeper, then command true
+	 * zero current and measure the A1 baseline while PWM remains active.
 	 */
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
@@ -269,7 +300,21 @@ static bool bh_fast_live_plot(float freq) {
 		return false;
 	}
 
-	mcpwm_foc_set_current_off_delay(0.10f);
+	mcpwm_foc_set_current_off_delay(0.25f);
+	float active_zero = 0.0f;
+	float zero_i = 0.0f;
+	if (!bh_fast_measure_active_zero(&active_zero, &zero_i)) {
+		commands_printf("BH_FAST_ABORT active-PWM A1 zero invalid");
+		bh_fast_set_current_ref(0.0f);
+		bh_release_locked();
+		return false;
+	}
+	bh_fast_sense_zero = active_zero;
+	commands_printf("BH_FAST_A1_ZERO off=%.7f V pwm=%.7f V shift=%+.6f mV I=%+.5f A LUT=%d",
+			(double)hardoff_zero, (double)active_zero,
+			(double)((active_zero - hardoff_zero) * 1e3f),
+			(double)zero_i, bh_sense_pwm_lut_valid ? 1 : 0);
+
 	mc_interface_set_pwm_callback(bh_fast_pwm_callback);
 	bh_fast_active = true;
 	bh_fast_set_current_ref(0.0f);
@@ -365,3 +410,5 @@ static void bh_fast_init_commands(void) {
 			"<Ipk_A> <freq_Hz> <path_mm> <area_mm2>",
 			terminal_bh_live_fast);
 }
+
+#undef BH_FAST_A1_ZERO_SAMPLES
