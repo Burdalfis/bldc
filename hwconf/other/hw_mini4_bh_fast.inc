@@ -1,17 +1,18 @@
-/* PWM-rate current-controlled B-H live mode.
+/* PWM-rate B-H live mode.
  *
- * VESC's FOC/current PI continues at full rate while the extra tracer work runs
- * at a decimated cadence. A1/current acquisition, median impulse rejection, H
- * calculation and per-cycle B integration run at that tracer cadence.
+ * VESC's FOC machinery continues at full rate while the MINI4 raw-SVM hook
+ * supplies a fixed A-B voltage vector. A1/current acquisition, median impulse
+ * rejection, H calculation and per-cycle B integration run at /2 cadence.
  */
 
-#define BH_FAST_OVERCURRENT_SAMPLES       4
+#define BH_FAST_OVERCURRENT_SAMPLES       1
 #define BH_FAST_HARD_CLIPS_PER_SEC        10
 #define BH_FAST_DIAG_DIV                  2U
 #define BH_FAST_A1_ZERO_SAMPLES           40U
 
-/* foc_math.h still contains the MINI4 raw-SVM hook from the old voltage-drive
- * prototype. Keep its linkage satisfied but leave it permanently disabled.
+/* foc_math.h contains a MINI4-only hook immediately before ordinary SVM timing
+ * generation. bh_live_fast uses it to impose a known fixed-axis A-B voltage
+ * without asking either the VESC current PI or duty controller to create it.
  */
 volatile bool bh_foc_svm_override_active = false;
 volatile float bh_foc_svm_override_alpha = 0.0f;
@@ -78,12 +79,36 @@ static inline float bh_fast_median3(float a, float b, float c) {
 	return b;
 }
 
-/* Update the ordinary FOC d-axis current target. Fixed A-B geometry:
- * Ia=+Iline, Ib=-Iline, Ic=0, Id=2/sqrt(3)*Iline.
+/* The legacy normalized triangle is now used only for its sign. Positive sign
+ * commands +Dpk across A-B and negative sign commands -Dpk. A bipolar square
+ * voltage produces the approximately triangular winding-current/H sweep wanted
+ * for this fixture.
+ *
+ * For signed A-B line duty D = Vab/Vbus, the alpha/beta vector
+ *   alpha = D/2
+ *   beta  = -D/(2*sqrt(3))
+ * gives Va=+D/2, Vb=-D/2 and therefore Vab=D. Even at D=1 the vector magnitude
+ * is only 1/sqrt(3), safely inside the ordinary SVM linear magnitude limit.
  */
 static inline void bh_fast_set_current_ref(float i_line) {
+	/* Keep VESC's FOC state machine alive on the wrapper's tiny keeper target.
+	 * The raw-SVM values below replace its resulting voltage vector at the final
+	 * SVM call, so the current PI does not control the fixture excitation.
+	 */
 	float i_axis = i_line * BH_TWO_BY_SQRT3;
 	mcpwm_foc_set_openloop_phase(i_axis, BH_FOC_PHASE_DEG);
+
+	float signed_duty = 0.0f;
+	if (i_line > 1.0e-6f) {
+		signed_duty = bh_fast_duty_pk;
+	} else if (i_line < -1.0e-6f) {
+		signed_duty = -bh_fast_duty_pk;
+	}
+
+	bh_foc_svm_override_alpha = 0.5f * signed_duty;
+	bh_foc_svm_override_beta = -0.288675134595f * signed_duty;
+	bh_foc_svm_override_active = true;
+	bh_fast_last_duty_cmd = signed_duty;
 	bh_fast_last_iref = i_line;
 }
 
@@ -92,8 +117,8 @@ static inline void bh_fast_abort_drive(void) {
 	bh_fast_active = false;
 }
 
-/* Measure the actual A1 baseline with FOC/PWM running at zero commanded coil
- * current. If an R/L calibration LUT exists, remove its tiny current-dependent
+/* Measure the actual A1 baseline with FOC/PWM running at zero applied A-B
+ * voltage. If an R/L calibration LUT exists, remove its tiny current-dependent
  * contribution sample-by-sample so this remains a true zero-current baseline.
  */
 static bool bh_fast_measure_active_zero(float *zero_v, float *i_avg) {
@@ -284,14 +309,14 @@ static bool bh_fast_live_plot(float freq) {
 	}
 	bh_fast_reset_state(freq, hardoff_zero);
 
-	commands_printf("BH_FAST_START Ipk=%.6f A f=%.6f Hz foc_fs=%.1f Hz tracer_fs=%.1f Hz div=%u turns=%g/%g offzero=%.7f V sense=%+d",
-			(double)bh_i_pk, (double)freq, (double)bh_fast_fs,
+	commands_printf("BH_FAST_START Dpk=%.6f f=%.6f Hz foc_fs=%.1f Hz tracer_fs=%.1f Hz div=%u turns=%g/%g offzero=%.7f V sense=%+d rawSVM=1",
+			(double)bh_fast_duty_pk, (double)freq, (double)bh_fast_fs,
 			(double)bh_fast_update_hz, (unsigned)BH_FAST_DIAG_DIV,
 			(double)BH_EXC_TURNS, (double)BH_SENSE_TURNS,
 			(double)hardoff_zero, bh_sense_polarity);
 
-	/* Enter RUNNING gently with the existing 10 mA keeper, then command true
-	 * zero current and measure the A1 baseline while PWM remains active.
+	/* Enter RUNNING gently with the existing 10 mA keeper, then impose zero raw
+	 * A-B voltage and measure the A1 baseline while PWM remains active.
 	 */
 	bh_apply_current(0.0f);
 	if (mc_interface_get_state() != MC_STATE_RUNNING) {
@@ -307,6 +332,7 @@ static bool bh_fast_live_plot(float freq) {
 		commands_printf("BH_FAST_ABORT active-PWM A1 zero invalid");
 		bh_fast_set_current_ref(0.0f);
 		bh_release_locked();
+		bh_foc_svm_override_active = false;
 		return false;
 	}
 	bh_fast_sense_zero = active_zero;
@@ -334,12 +360,12 @@ static bool bh_fast_live_plot(float freq) {
 
 		if (timer_seconds_elapsed_since(stat_t0) >= 1.0f) {
 			stat_t0 = timer_time_now();
-			float track = bh_i_pk > 0.001f ? 100.0f * bh_fast_last_amp / bh_i_pk : 0.0f;
-			commands_printf("BH_FAST_STAT Iamp=%.5f A track=%.2f%% Icenter=%+.5f A Iref=%+.5f A H=%+.2f A/m B=%+.7f T Id=%+.5f A Vd=%+.5f V duty=%+.5f clips=%u",
-					(double)bh_fast_last_amp, (double)track,
-					(double)bh_fast_last_center, (double)bh_fast_last_iref,
+			commands_printf("BH_FAST_STAT Dcmd=%+.6f Iamp=%.5f A Icenter=%+.5f A H=%+.2f A/m B=%+.7f T Id=%+.5f A duty=%+.5f clips=%u",
+					(double)bh_fast_last_duty_cmd,
+					(double)bh_fast_last_amp,
+					(double)bh_fast_last_center,
 					(double)bh_fast_last_h, (double)bh_fast_last_b,
-					(double)mcpwm_foc_get_id(), (double)mcpwm_foc_get_vd(),
+					(double)mcpwm_foc_get_id(),
 					(double)mc_interface_get_duty_cycle_now(),
 					(unsigned)bh_fast_hard_clips);
 		}
