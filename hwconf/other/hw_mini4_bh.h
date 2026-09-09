@@ -73,10 +73,11 @@ static volatile float bh_fast_last_b;
 #define BH_FAST_DIAG_REPORT_MS          1000U
 #define BH_FAST_DUTY_LINE_LIMIT_A       5.0f
 
-/* bh_live_fast is now voltage/duty driven. The public argument is peak duty
- * magnitude 0..1. Internally the existing triangle reference is used only as
- * a normalized -1..+1 waveform; the ordinary FOC current PI is bypassed by
- * translating it into fixed-axis open-loop duty. H remains measured current.
+/* bh_live_fast is voltage-driven. The public argument is peak A-B line duty
+ * magnitude 0..1. The existing FOC state machine stays RUNNING on a harmless
+ * keeper current, while the MINI4 raw-SVM hook replaces its final alpha/beta
+ * modulation with the requested fixed-axis voltage vector. H remains measured
+ * current; the current PI does not determine the excitation waveform.
  */
 static float bh_fast_duty_pk = 0.0f;
 static volatile float bh_fast_last_duty_cmd = 0.0f;
@@ -113,9 +114,9 @@ static inline void bh_fast_diag_reset_work(void) {
     bh_fast_diag_have_b = false;
 }
 
-/* Give fast-mode startup a harmless nonzero current target so FOC is already
- * RUNNING before the fast callback takes over. This is startup-only; the live
- * excitation itself is open-loop duty after the include hook below.
+/* Give fast-mode startup a harmless nonzero target so FOC is already RUNNING
+ * before its callback takes over. Once the raw-SVM override is active, this
+ * current target only keeps the FOC machinery alive; it does not set voltage.
  */
 static inline void bh_fast_apply_keeper_current(float i_line) {
     if (fabsf(i_line) < 0.001f) {
@@ -179,24 +180,16 @@ static inline void bh_fast_worker_plot_sleep(unsigned sleep_ms) {
     chThdSleepMilliseconds(sleep_ms);
 }
 
-/* Convert the legacy normalized triangle reference into signed fixed-axis duty.
- * Keep duty magnitude positive and reverse the voltage vector by 180 degrees on
- * the negative half. This avoids relying on negative-duty semantics in VESC.
+/* The included baseline fast path still calls mcpwm_foc_set_openloop_phase()
+ * whenever it updates its normalized reference. Keep the FOC state machine on
+ * a fixed 10 mA keeper instead. The actual A-B voltage is injected later by the
+ * raw-SVM override in bh_fast_set_current_ref(). This helper is defined before
+ * the macro below, so this call reaches the real VESC function.
  */
-static inline void bh_fast_openloop_duty_from_axis(float i_axis, float phase_unused) {
+static inline void bh_fast_keep_foc_running(float i_axis_unused, float phase_unused) {
+    (void)i_axis_unused;
     (void)phase_unused;
-    float denom = bh_i_pk * BH_TWO_BY_SQRT3;
-    float norm = fabsf(denom) > 1.0e-9f ? i_axis / denom : 0.0f;
-    if (norm > 1.0f) norm = 1.0f;
-    if (norm < -1.0f) norm = -1.0f;
-
-    float signed_duty = bh_fast_duty_pk * norm;
-    float phase = BH_FOC_PHASE_DEG;
-    if (signed_duty < 0.0f) {
-        phase += 180.0f;
-    }
-    mcpwm_foc_set_openloop_duty_phase(fabsf(signed_duty), phase);
-    bh_fast_last_duty_cmd = signed_duty;
+    mcpwm_foc_set_openloop_phase(0.010f * BH_TWO_BY_SQRT3, BH_FOC_PHASE_DEG);
 }
 
 static void terminal_bh_live_fast_duty(int argc, const char **argv);
@@ -237,7 +230,7 @@ static inline void bh_fast_restore_pwm_callback(void) {
 #define mc_interface_lock() ((void)0)
 #define mc_interface_set_pwm_callback(p_func) BH_FAST_CB_DISPATCH(p_func)
 #define mcpwm_foc_set_openloop_phase(i_axis, phase) \
-        bh_fast_openloop_duty_from_axis((i_axis), (phase))
+        bh_fast_keep_foc_running((i_axis), (phase))
 #define terminal_register_command_callback(command, help, arg_names, cbf) \
         bh_fast_register_duty_command((command), (help), (arg_names), (cbf))
 #undef chThdSleepMilliseconds
@@ -256,12 +249,26 @@ static inline void bh_fast_restore_pwm_callback(void) {
 #undef BH_FAST_CB_DISPATCH_bh_fast_pwm_callback
 
 /* Baseline estimator remains deliberately simple. The only additions here are
- * passive cycle diagnostics and the duty reference hook above.
+ * passive cycle diagnostics and duty drive. Protection is checked at the full
+ * PWM callback rate before the /2 diagnostic/acquisition decimation.
  */
 static void bh_fast_pwm_callback(void) {
     bh_sample_scope_pwm_cb();
 
     if (!bh_fast_active) {
+        return;
+    }
+
+    /* Raw voltage drive can make current rise far faster than the old current-
+     * controlled tracer. Kill the SVM command immediately at full FOC cadence
+     * if measured A-B winding current exceeds the dedicated line-current limit.
+     */
+    if (fabsf(bh_coil_current()) > BH_FAST_DUTY_LINE_LIMIT_A) {
+        bh_foc_svm_override_alpha = 0.0f;
+        bh_foc_svm_override_beta = 0.0f;
+        bh_fast_last_duty_cmd = 0.0f;
+        bh_fast_overcurrent_abort = true;
+        bh_fast_active = false;
         return;
     }
 
@@ -342,7 +349,8 @@ static void bh_fast_pwm_callback(void) {
 /* Duty-mode parser for the existing bh_live_fast callback slot. bh_i_pk is an
  * internal safety surrogate only: choosing 5/1.5 A makes the legacy fast-path
  * overcurrent formula trip at about 5 A measured line current, while duty is
- * the actual excitation command.
+ * the actual excitation command. The full-rate guard above enforces the same
+ * 5 A limit sooner.
  */
 static void terminal_bh_live_fast_duty(int argc, const char **argv) {
     if (bh_is_busy()) {
@@ -351,7 +359,7 @@ static void terminal_bh_live_fast_duty(int argc, const char **argv) {
     }
     if (argc != 5) {
         commands_printf("Usage: bh_live_fast <duty_pk_0..1> <freq_Hz> <path_mm> <area_mm2>");
-        commands_printf("Example: bh_live_fast 0.02 25 21.9 3.65");
+        commands_printf("Example: bh_live_fast 0.002 25 21.9 3.65");
         return;
     }
 
@@ -386,7 +394,7 @@ static void terminal_bh_live_fast_duty(int argc, const char **argv) {
         return;
     }
 
-    commands_printf("B-H fast duty run queued: Dpk=%.6f f=%.4f Hz path=%.3f mm area=%.4f mm^2 Iabort~%.1f A",
+    commands_printf("B-H fast raw-SVM duty run queued: Dpk=%.6f f=%.4f Hz path=%.3f mm area=%.4f mm^2 Iabort=%.1f A",
             (double)duty_pk, (double)freq, (double)path_mm,
             (double)area_mm2, (double)BH_FAST_DUTY_LINE_LIMIT_A);
 }
