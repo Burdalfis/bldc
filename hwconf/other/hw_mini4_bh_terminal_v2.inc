@@ -1,17 +1,17 @@
 /* Sampled-data scope overlay for the dedicated MINI4 B-H fixture.
  *
- * mc_interface invokes the PWM callback after the FOC/current calculations but
- * before it copies the debug-sampling channels. Phase C is physically unused
- * by this fixture, so while a tracer job is running replace the sampled phase-C
- * current channel with INA282 OUT relative to its nominal 1.65 V centre.
- *
- * VESC Tool will still label this trace as amperes. For the B-H target only,
- * interpret 1.000 displayed A on phase C as +1.000 V from 1.65 V at INA OUT.
- * Raw sampled-data mode is intentionally not remapped; use normal/non-raw mode.
+ * Phase C is unused. During bh_live_fast, show the median-filtered and
+ * analog-de-embedded A1 signal (INA-output-equivalent volts, centered on the
+ * active-PWM zero and including the optional current LUT correction). Outside
+ * fast mode retain the original raw A1-minus-1.65 V diagnostic.
  */
 static void bh_sample_scope_pwm_cb(void) {
 	if (bh_running) {
-		ADC_curr_norm_value[2] = bh_sense_out_v() - 1.65f;
+		if (bh_fast_active && bh_fast_de_n > 0U) {
+			ADC_curr_norm_value[2] = bh_fast_scope_a1_v;
+		} else {
+			ADC_curr_norm_value[2] = bh_sense_out_v() - 1.65f;
+		}
 	}
 }
 
@@ -148,10 +148,10 @@ static bool bh_queue_l_sweep(float imin, float imax, float ippo,
 	bh_l_i_min = imin;
 	bh_l_i_max = imax;
 	bh_l_i_ppo = ippo;
-	bh_i_pk = imax; // lets bh_common_cfg raise current limits for the whole matrix
+	bh_i_pk = imax;
 	bh_fmin = fmin;
 	bh_fmax = fmax;
-	bh_sweep_step = fppo; // existing logarithmic worker is the frequency axis
+	bh_sweep_step = fppo;
 	bh_cycles = 1;
 	bh_l_sweep_mode = true;
 	bh_l_sweep_suppress_metric = false;
@@ -189,8 +189,6 @@ static void terminal_bh_l_point(int argc, const char **argv) {
 }
 
 static void bh_init_commands(void) {
-	// Dedicated target: claim the single global PWM callback for the sampled-data
-	// scope overlay. The callback is inert unless a B-H job is actually running.
 	mc_interface_set_pwm_callback(bh_sample_scope_pwm_cb);
 	bh_init_commands_legacy();
 	terminal_register_command_callback(
@@ -216,6 +214,6 @@ static void bh_init_commands(void) {
 	terminal_register_command_callback(
 			"bh_l_sweep",
 			"Sweep excitation current and frequency; report tracking, phase, Rmag, Xmag and signed L.",
-			"<Imin_A> <Imax_A> <I_points_per_octave> <fmin_Hz> <fmax_Hz> <f_points_per_octave>",
+			"<Imin_A> <Imax_A> <f_points_per_octave> <fmin_Hz> <fmax_Hz> <f_points_per_octave>",
 			terminal_bh_l_sweep);
 }
