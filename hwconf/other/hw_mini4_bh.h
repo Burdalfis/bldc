@@ -81,6 +81,12 @@ static volatile float bh_fast_last_b;
 static float bh_fast_duty_pk = 0.0f;
 static volatile float bh_fast_last_duty_cmd = 0.0f;
 
+/* Plot-state tentative declarations are needed by the startup helper below;
+ * the initialized definitions remain next to the worker transport function.
+ */
+static bool bh_fast_plot_started;
+static unsigned bh_fast_plot_elapsed_ms;
+
 /* Cycle-closure diagnostics. These are snapshots only: nothing here feeds back
  * into A1, B, H, duty, centering, or any other estimator state.
  */
