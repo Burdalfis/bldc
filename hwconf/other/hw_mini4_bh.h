@@ -313,36 +313,41 @@ static void bh_fast_pwm_callback(void) {
 
 #include "hw_mini4_bh_worker_v2.inc"
 
-static void terminal_bh_a1_lut(int argc, const char **argv) {
-    if (bh_is_busy()) {
-        commands_printf("BH_A1_LUT busy");
-        return;
-    }
-    if (argc == 1) {
-        commands_printf("BH_A1_LUT %d/%d",
-                bh_sense_pwm_lut_valid ? 1 : 0,
-                bh_fast_a1_lut_saved_valid ? 1 : 0);
-        return;
-    }
-    if (argc != 2 || argv[1][1] != '\0' ||
-            (argv[1][0] != '0' && argv[1][0] != '1')) {
-        commands_printf("Usage: bh_a1_lut [0|1]");
+/* Reuse bh_live_fast's existing callback slot for the LUT diagnostic. */
+static void terminal_bh_live_fast_with_lut(int argc, const char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "lut") == 0) {
+        if (bh_is_busy()) {
+            commands_printf("BH_A1_LUT busy");
+            return;
+        }
+        if (argc == 2) {
+            commands_printf("BH_A1_LUT %d/%d",
+                    bh_sense_pwm_lut_valid ? 1 : 0,
+                    bh_fast_a1_lut_saved_valid ? 1 : 0);
+            return;
+        }
+        if (argc != 3 || argv[2][1] != '\0' ||
+                (argv[2][0] != '0' && argv[2][0] != '1')) {
+            commands_printf("Usage: bh_live_fast lut [0|1]");
+            return;
+        }
+        if (argv[2][0] == '0') {
+            if (bh_sense_pwm_lut_valid) {
+                bh_fast_a1_lut_saved_valid = true;
+            }
+            bh_sense_pwm_lut_valid = false;
+            commands_printf("BH_A1_LUT off");
+        } else if (bh_sense_pwm_lut_valid || bh_fast_a1_lut_saved_valid) {
+            bh_sense_pwm_lut_valid = true;
+            bh_fast_a1_lut_saved_valid = true;
+            commands_printf("BH_A1_LUT on");
+        } else {
+            commands_printf("BH_A1_LUT no table");
+        }
         return;
     }
 
-    if (argv[1][0] == '0') {
-        if (bh_sense_pwm_lut_valid) {
-            bh_fast_a1_lut_saved_valid = true;
-        }
-        bh_sense_pwm_lut_valid = false;
-        commands_printf("BH_A1_LUT off");
-    } else if (bh_sense_pwm_lut_valid || bh_fast_a1_lut_saved_valid) {
-        bh_sense_pwm_lut_valid = true;
-        bh_fast_a1_lut_saved_valid = true;
-        commands_printf("BH_A1_LUT on");
-    } else {
-        commands_printf("BH_A1_LUT no table");
-    }
+    terminal_bh_live_fast(argc, argv);
 }
 
 #define bh_init_commands bh_init_commands_v2_base
@@ -352,8 +357,13 @@ static void bh_init_commands(void) {
     bh_init_commands_v2_base();
     bh_live_init_commands();
     bh_fast_init_commands();
+    /* Re-registering the same command replaces its callback without consuming
+     * another terminal callback slot. MINI4 is already at the 40-slot limit.
+     */
     terminal_register_command_callback(
-            "bh_a1_lut", "A1 LUT on/off.", "[0|1]", terminal_bh_a1_lut);
+            "bh_live_fast", "Fast B-H; 'bh_live_fast lut [0|1]' toggles A1 LUT.",
+            "<Ipk_A> <freq_Hz> <path_mm> <area_mm2>",
+            terminal_bh_live_fast_with_lut);
 }
 
 #undef bh_set_measurement_gains
